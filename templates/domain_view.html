@@ -1,1 +1,150 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">{{ domain.domain_name }}</h2><div class="card shadow-sm p-3"><div class="row mb-3"><div class="col-md-3"><strong>Registrar</strong></div><div class="col-md-9">{{ domain.registrar or "—" }}</div></div><div class="row mb-3"><div class="col-md-3"><strong>DNS Provider</strong></div><div class="col-md-9">{{ domain.dns_provider or "—" }}</div></div><div class="row mb-3"><div class="col-md-3"><strong>Nameservers</strong></div><div class="col-md-9">{% if domain.nameservers %}<pre class="mb-0" style="white-space:pre-wrap">{{ domain.nameservers }}</pre>{% else %}—{% endif %}</div></div><div class="row mb-3"><div class="col-md-3"><strong>Expires On</strong></div><div class="col-md-9">{% if domain.expires_on %}{{ domain.expires_on.strftime("%Y-%m-%d") }}{% else %}—{% endif %}</div></div>{% if domain.notes %}<div class="row mb-3"><div class="col-md-3"><strong>Notes</strong></div><div class="col-md-9"><div class="border rounded p-2 bg-light">{{ domain.notes }}</div></div></div>{% endif %}<a href="{{ url_for('domain_edit', domain_id=domain.id) }}" class="btn btn-primary">Edit</a><a href="{{ url_for('domains_list') }}" class="btn btn-secondary">Back</a><form method="post" action="{{ url_for('domain_whois_refresh', domain_id=domain.id) }}" class="d-inline" onsubmit="return confirm('Refresh WHOIS details now?');"><button class="btn btn-outline-secondary">Refresh WHOIS</button></form><form method="post" action="{{ url_for('domain_delete', domain_id=domain.id) }}" class="d-inline" onsubmit="return confirm('Delete this domain?');"><button class="btn btn-outline-danger">Delete</button></form></div>{% endblock %}
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">{{ domain.domain_name }}</h2>
+    <div class="text-muted">Domain details and live DNS summary</div>
+  </div>
+  <div class="d-flex gap-2">
+    <form method="post" action="{{ url_for('domain_whois_refresh', domain_id=domain.id) }}">
+      <button class="btn btn-outline-secondary">Refresh WHOIS</button>
+    </form>
+    <a href="{{ url_for('domain_edit', domain_id=domain.id) }}" class="btn btn-primary">Edit</a>
+    <a href="{{ url_for('domains_list') }}" class="btn btn-secondary">Back</a>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Overview</h5>
+
+        <div class="row mb-2">
+          <div class="col-4"><strong>Registrar</strong></div>
+          <div class="col-8">{{ domain.registrar or "—" }}</div>
+        </div>
+
+        <div class="row mb-2">
+          <div class="col-4"><strong>DNS Provider</strong></div>
+          <div class="col-8">{{ domain.dns_provider or "—" }}</div>
+        </div>
+
+        <div class="row mb-2">
+          <div class="col-4"><strong>Nameservers</strong></div>
+          <div class="col-8">
+            {% if domain.nameservers %}
+              <pre class="mb-0" style="white-space:pre-wrap;">{{ domain.nameservers }}</pre>
+            {% else %}
+              —
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="row mb-2">
+          <div class="col-4"><strong>Expires On</strong></div>
+          <div class="col-8">
+            {% if domain.expires_on %}
+              {{ domain.expires_on.strftime("%Y-%m-%d") }}
+            {% else %}
+              —
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-4"><strong>Notes</strong></div>
+          <div class="col-8">{{ domain.notes or "—" }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Email Health</h5>
+
+        {% if dns_snapshot and dns_snapshot.dns_available %}
+          {% if dns_snapshot.email_health %}
+            <div class="list-group list-group-flush">
+              {% for item in dns_snapshot.email_health %}
+                <div class="list-group-item px-0">
+                  <div class="d-flex justify-content-between align-items-start gap-3">
+                    <div>
+                      <div class="fw-semibold">{{ item.label }}</div>
+                      <div class="small text-muted">{{ item.message }}</div>
+                    </div>
+                    <span class="badge text-bg-{{ item.status }}">{{ item.status|upper }}</span>
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="text-muted mb-0">No email health data available.</p>
+          {% endif %}
+        {% else %}
+          <div class="alert alert-warning mb-0">
+            Live DNS lookup is unavailable. Install <code>dnspython</code> and confirm the route is passing <code>dns_snapshot</code>.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h5 class="card-title">DNS Records</h5>
+
+    {% if dns_snapshot and dns_snapshot.dns_available %}
+      {% for record_type in ["A", "MX", "TXT", "NS", "DMARC"] %}
+        <div class="mb-4">
+          <h6 class="mb-2">{{ record_type }} Records</h6>
+
+          {% set rows = dns_snapshot.records[record_type] %}
+          {% if rows %}
+            <div class="table-responsive">
+              <table class="table table-sm table-hover align-middle">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Host</th>
+                    {% if record_type == "MX" %}
+                      <th>Priority</th>
+                    {% endif %}
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in rows %}
+                    <tr>
+                      <td>{{ row.type }}</td>
+                      <td>{{ row.host }}</td>
+                      {% if record_type == "MX" %}
+                        <td>{{ row.priority }}</td>
+                      {% endif %}
+                      <td style="word-break:break-word;">{{ row.value }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="text-muted mb-0">No {{ record_type }} records found.</p>
+          {% endif %}
+        </div>
+      {% endfor %}
+    {% else %}
+      <p class="text-muted mb-0">Live DNS checks are unavailable.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="d-flex gap-2">
+  <form method="post" action="{{ url_for('domain_delete', domain_id=domain.id) }}" onsubmit="return confirm('Delete this domain?');">
+    <button class="btn btn-outline-danger">Delete</button>
+  </form>
+</div>
+{% endblock %}

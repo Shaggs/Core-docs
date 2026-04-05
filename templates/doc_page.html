@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">{{ page.title }}</h2>
+
+<div class="mb-3 d-flex gap-2 flex-wrap">
+  <a href="{{ url_for('docs', folder=page.folder_id) }}" class="btn btn-secondary">Back to Documents</a>
+  <a href="{{ url_for('docs_page_edit', page_id=page.id) }}" class="btn btn-primary">Edit</a>
+  <form method="post" action="{{ url_for('docs_page_delete', page_id=page.id) }}" onsubmit="return confirm('Delete this document?');">
+    <button class="btn btn-outline-danger">Delete</button>
+  </form>
+</div>
+
+<div class="card shadow-sm p-3 mb-3">
+  <div class="row mb-2">
+    <div class="col-md-3"><strong>Updated</strong></div>
+    <div class="col-md-9">
+      {% if page.updated_at %}
+        {{ page.updated_at.strftime("%Y-%m-%d %H:%M") }}
+      {% else %}
+        —
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col-md-3"><strong>Updated By</strong></div>
+    <div class="col-md-9">
+      {% if page.updated_by_user %}
+        {{ page.updated_by_user.email }}
+      {% else %}
+        —
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm p-4">
+  <div class="doc-page-content">
+    {{ page.body_html|safe }}
+  </div>
+</div>
+{% endblock %}

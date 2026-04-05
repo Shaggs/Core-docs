@@ -1,1 +1,33 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">{{ org.name }}</h2><div class="row g-3">{% for title, endpoint, desc in [('Passwords','pw_list','Manage credentials and audit history.'),('Documentation','docs','Folders and uploaded files.'),('Domains','domains_list','Registrar, DNS and expiry tracking.'),('Contacts','contacts_list','People, roles and decision makers.'),('Sites','sites_list','Addresses and office locations.'),('Network','network_list','IP and MAC tracking.'),('Assets','assets','Device and equipment register.')] %}<div class="col-md-6"><div class="card shadow-sm"><div class="card-body"><h5 class="card-title">{{ title }}</h5><p class="text-muted">{{ desc }}</p><a href="{{ url_for(endpoint) }}" class="btn btn-outline-primary">Open {{ title }}</a></div></div></div>{% endfor %}</div>{% endblock %}
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">{{ org.name }}</h2>
+    <div class="text-muted">Organisation home</div>
+  </div>
+  <button type="button" class="btn btn-primary" onclick="openSearch()">Search</button>
+</div>
+{% if current_user.is_super_admin %}<a href="{{ url_for('org_edit', org_id=org.id) }}" class="btn btn-outline-secondary">Edit Organisation</a>{% endif %}
+<div class="row g-3">
+  {% for title, endpoint, desc in [
+    ('Passwords','pw_list','Manage credentials and audit history.'),
+    ('Documentation','docs','Folders, uploaded files and rich-text docs.'),
+    ('Domains','domains_list','Registrar, DNS and expiry tracking.'),
+    ('Contacts','contacts_list','People, roles and decision makers.'),
+    ('Sites','sites_list','Addresses and office locations.'),
+    ('Network','network_list','IP and MAC tracking.'),
+    ('Assets','assets','Device and equipment register.')
+  ] %}
+  <div class="col-md-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">{{ title }}</h5>
+        <p class="text-muted">{{ desc }}</p>
+        <a href="{{ url_for(endpoint) }}" class="btn btn-outline-primary">Open {{ title }}</a>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

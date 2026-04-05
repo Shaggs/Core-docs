@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <div>
+    <h2 class="mb-0">{{ org.name }}</h2>
+    <div class="text-muted">Organisation home</div>
+  </div>
+  <div class="d-flex gap-2">
+    <button type="button" class="btn btn-primary" onclick="openSearch()">Search</button>
+    <button type="button" class="btn btn-outline-secondary" onclick="openAudit()">Audit</button>
+  </div>
+</div>
+
+{% set counts = dashboard_data.counts if dashboard_data is defined and dashboard_data else {} %}
+<div class="row g-3 mb-4">
+  <div class="col-sm-6 col-xl-3">
+    <div class="card shadow-sm metric-card h-100">
+      <div class="card-body">
+        <div class="text-muted small">Passwords</div>
+        <div class="display-6 fw-semibold">{{ counts.passwords or 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="card shadow-sm metric-card h-100">
+      <div class="card-body">
+        <div class="text-muted small">Documents</div>
+        <div class="display-6 fw-semibold">{{ counts.documents or 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="card shadow-sm metric-card h-100">
+      <div class="card-body">
+        <div class="text-muted small">Contacts</div>
+        <div class="display-6 fw-semibold">{{ counts.contacts or 0 }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="card shadow-sm metric-card h-100">
+      <div class="card-body">
+        <div class="text-muted small">Assets</div>
+        <div class="display-6 fw-semibold">{{ counts.assets or 0 }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Alerts</h5>
+        {% set expiring = dashboard_data.expiring_domains if dashboard_data is defined and dashboard_data else [] %}
+        {% set issues = dashboard_data.asset_issues if dashboard_data is defined and dashboard_data else {} %}
+        {% if expiring or (issues.missing_serial_numbers if issues else 0) %}
+          <div class="list-group list-group-flush">
+            {% for item in expiring %}
+              <a href="{{ url_for('domain_view', domain_id=item.id) }}" class="list-group-item list-group-item-action px-0">
+                <div class="fw-semibold">{{ item.domain_name }}</div>
+                <div class="small text-muted">Domain expires on {{ item.expires_on }}</div>
+              </a>
+            {% endfor %}
+            {% if issues and issues.missing_serial_numbers %}
+              <div class="list-group-item px-0">
+                <div class="fw-semibold">Assets needing cleanup</div>
+                <div class="small text-muted">{{ issues.missing_serial_numbers }} assets are missing serial numbers.</div>
+              </div>
+            {% endif %}
+          </div>
+        {% else %}
+          <p class="text-muted mb-0">No current alerts.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Recently Updated Passwords</h5>
+        {% set recent = dashboard_data.recent_passwords if dashboard_data is defined and dashboard_data else [] %}
+        {% if recent %}
+          <div class="list-group list-group-flush">
+            {% for item in recent %}
+              <a href="{{ url_for('pw_view', pw_id=item.id) }}" class="list-group-item list-group-item-action px-0">
+                <div class="fw-semibold">{{ item.name }}</div>
+                <div class="small text-muted">Updated {{ item.updated_at }}</div>
+              </a>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-muted mb-0">No recent password activity.</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  {% for title, endpoint, desc in [
+    ('Passwords','pw_list','Manage credentials and audit history.'),
+    ('Documentation','docs','Folders, uploaded files and rich-text docs.'),
+    ('Domains','domains_list','Registrar, DNS and expiry tracking.'),
+    ('Contacts','contacts_list','People, roles and decision makers.'),
+    ('Sites','sites_list','Addresses and office locations.'),
+    ('Network','network_list','IP and MAC tracking.'),
+    ('Assets','assets','Device and equipment register.')
+  ] %}
+  <div class="col-md-6 col-xl-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">{{ title }}</h5>
+        <p class="text-muted">{{ desc }}</p>
+        <a href="{{ url_for(endpoint) }}" class="btn btn-outline-primary">Open {{ title }}</a>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

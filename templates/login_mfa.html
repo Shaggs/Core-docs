@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container py-5" style="max-width: 480px;">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h2 class="mb-3">Multi-Factor Authentication</h2>
+      <p class="text-muted">Enter the 6-digit code from your authenticator app for <strong>{{ email }}</strong>.</p>
+
+      <form method="post">
+        <div class="mb-3">
+          <label class="form-label fw-semibold">Authentication code</label>
+          <input type="text" name="code" class="form-control form-control-lg" maxlength="6" inputmode="numeric" autocomplete="one-time-code" required>
+        </div>
+
+        <div class="d-grid gap-2">
+          <button type="submit" class="btn btn-primary">Verify and Sign In</button>
+          <a href="{{ url_for('login') }}" class="btn btn-outline-secondary">Back to Login</a>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

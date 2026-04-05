@@ -1,6 +1,8 @@
 
 import os
 import smtplib
+import base64
+import hashlib
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -23,6 +25,17 @@ try:
 except Exception:
     pywhois = None
 
+try:
+    import dns.resolver
+except Exception:
+    dns = None
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_ROOT = BASE_DIR / "uploads"
 UPLOAD_ROOT.mkdir(exist_ok=True)
@@ -33,6 +46,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", f"sqlite:
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 50 * 1024 * 1024))
 app.config["RESET_TOKEN_SALT"] = "password-reset-salt"
+app.config["VAULT_KEY"] = os.environ.get("VAULT_KEY")
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
@@ -41,6 +55,21 @@ login_manager.login_view = "login"
 ALLOWED_EXTS = {"pdf","doc","docx","xls","xlsx","ppt","pptx","txt","jpg","jpeg","png","gif","webp"}
 
 # ---------------- Models ----------------
+
+class DocPage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False)
+    folder_id = db.Column(db.Integer, db.ForeignKey("doc_folder.id"), nullable=True)
+    title = db.Column(db.String(255), nullable=False)
+    body_html = db.Column(db.Text, nullable=False, default="")
+    created_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    updated_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    folder = db.relationship("DocFolder", backref="pages")
+    created_by_user = db.relationship("User", foreign_keys=[created_by])
+    updated_by_user = db.relationship("User", foreign_keys=[updated_by])
 class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(320), unique=True, nullable=False, index=True)
@@ -188,11 +217,217 @@ class SMTPSettings(db.Model):
     use_ssl = db.Column(db.Boolean, default=False)
 
 
+class AuditLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=True)
+    action = db.Column(db.String(120), nullable=False, index=True)
+    entity_type = db.Column(db.String(120), nullable=False, index=True)
+    entity_id = db.Column(db.String(120), nullable=True)
+    details = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    user = db.relationship("User", foreign_keys=[user_id])
+
+class AssetAssignment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    asset_id = db.Column(db.Integer, db.ForeignKey("asset.id"), nullable=False, unique=True)
+    site_id = db.Column(db.Integer, db.ForeignKey("site_address.id"), nullable=True)
+    contact_id = db.Column(db.Integer, db.ForeignKey("site_contact.id"), nullable=True)
+    status = db.Column(db.String(50), nullable=False, default="active")
+    notes = db.Column(db.Text, nullable=True)
+    updated_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    asset = db.relationship("Asset", backref=db.backref("assignment", uselist=False))
+    site = db.relationship("SiteAddress", foreign_keys=[site_id])
+    contact = db.relationship("SiteContact", foreign_keys=[contact_id])
+    updated_by_user = db.relationship("User", foreign_keys=[updated_by])
+
+
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 # ---------------- Helpers ----------------
+
+def _snippet(text, q, radius=80):
+    if not text:
+        return ""
+    text = str(text)
+    lower_text = text.lower()
+    lower_q = q.lower()
+    idx = lower_text.find(lower_q)
+    if idx == -1:
+        return text[: radius * 2].strip()
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(q) + radius)
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
+
+def _get_vault_cipher():
+    if Fernet is None:
+        return None
+    raw_key = app.config.get("VAULT_KEY")
+    if raw_key:
+        try:
+            key = raw_key.encode() if isinstance(raw_key, str) else raw_key
+            return Fernet(key)
+        except Exception:
+            pass
+    derived = hashlib.sha256(app.config["SECRET_KEY"].encode("utf-8")).digest()
+    key = base64.urlsafe_b64encode(derived)
+    return Fernet(key)
+
+def encrypt_secret(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and value.startswith("enc:"):
+        return value
+    cipher = _get_vault_cipher()
+    if cipher is None:
+        return value
+    token = cipher.encrypt(str(value).encode("utf-8")).decode("utf-8")
+    return f"enc:{token}"
+
+def decrypt_secret(value):
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    if not value.startswith("enc:"):
+        return value
+    cipher = _get_vault_cipher()
+    if cipher is None:
+        return ""
+    try:
+        return cipher.decrypt(value[4:].encode("utf-8")).decode("utf-8")
+    except Exception:
+        return ""
+
+def log_audit(action, entity_type, entity_id=None, org_id=None, details=None, user_id=None):
+    try:
+        entry = AuditLog(
+            user_id=user_id if user_id is not None else (current_user.id if current_user.is_authenticated else None),
+            org_id=org_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=str(entity_id) if entity_id is not None else None,
+            details=details,
+        )
+        db.session.add(entry)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+def get_dashboard_data(org_id):
+    now = datetime.utcnow().date()
+    expiring_domains = Domain.query.filter(
+        Domain.org_id == org_id,
+        Domain.expires_on.isnot(None),
+        Domain.expires_on <= (now + timedelta(days=60))
+    ).order_by(Domain.expires_on.asc()).limit(10).all()
+
+    recent_passwords = Password.query.filter_by(org_id=org_id).order_by(Password.updated_at.desc()).limit(10).all()
+    assets_missing_serial = Asset.query.filter(
+        Asset.org_id == org_id,
+        db.or_(Asset.serial_number.is_(None), Asset.serial_number == "")
+    ).count()
+
+    docs_count = DocFile.query.filter_by(org_id=org_id).count() + DocPage.query.filter_by(org_id=org_id).count()
+    password_count = Password.query.filter_by(org_id=org_id).count()
+    contact_count = SiteContact.query.filter_by(org_id=org_id).count()
+    asset_count = Asset.query.filter_by(org_id=org_id).count()
+
+    return {
+        "counts": {
+            "passwords": password_count,
+            "documents": docs_count,
+            "contacts": contact_count,
+            "assets": asset_count,
+        },
+        "expiring_domains": [
+            {"id": d.id, "domain_name": d.domain_name, "expires_on": d.expires_on.strftime("%Y-%m-%d") if d.expires_on else ""}
+            for d in expiring_domains
+        ],
+        "recent_passwords": [
+            {"id": p.id, "name": p.name, "updated_at": p.updated_at.strftime("%Y-%m-%d %H:%M") if p.updated_at else ""}
+            for p in recent_passwords
+        ],
+        "asset_issues": {"missing_serial_numbers": assets_missing_serial},
+    }
+
+def dns_query(name, record_type):
+    if dns is None:
+        return []
+    try:
+        answers = dns.resolver.resolve(name, record_type, lifetime=3)
+        rows = []
+        for rdata in answers:
+            if record_type == "MX":
+                rows.append({"type": "MX", "host": name, "value": str(rdata.exchange).rstrip("."), "priority": int(rdata.preference)})
+            else:
+                rows.append({"type": record_type, "host": name, "value": str(rdata).strip().rstrip(".")})
+        return rows
+    except Exception:
+        return []
+
+def fetch_dns_snapshot(domain_name):
+    if not domain_name:
+        return {"records": {"A": [], "MX": [], "TXT": [], "NS": [], "DMARC": []}, "email_health": [], "dns_available": False}
+
+    a_records = dns_query(domain_name, "A")
+    mx_records = dns_query(domain_name, "MX")
+    txt_records = dns_query(domain_name, "TXT")
+    ns_records = dns_query(domain_name, "NS")
+    dmarc_records = dns_query(f"_dmarc.{domain_name}", "TXT")
+
+    spf_record = None
+    for record in txt_records:
+        value = record["value"].strip('"')
+        if value.lower().startswith("v=spf1"):
+            spf_record = value
+            break
+
+    dmarc_record = None
+    for record in dmarc_records:
+        value = record["value"].strip('"')
+        if value.lower().startswith("v=dmarc1"):
+            dmarc_record = value
+            break
+
+    mx_values = [r["value"].lower() for r in mx_records]
+    txt_values = [r["value"].strip('"').lower() for r in txt_records]
+    email_health = []
+
+    if mx_records:
+        if any("mail.protection.outlook.com" in v for v in mx_values):
+            email_health.append({"status": "success", "label": "MX", "message": "MX appears to point to Microsoft 365."})
+        elif any("google.com" in v or "googlemail.com" in v or "aspmx.l.google.com" in v for v in mx_values):
+            email_health.append({"status": "success", "label": "MX", "message": "MX appears to point to Google Workspace."})
+        else:
+            email_health.append({"status": "warning", "label": "MX", "message": "MX records exist, but provider was not recognised."})
+    else:
+        email_health.append({"status": "danger", "label": "MX", "message": "No MX records found."})
+
+    email_health.append({"status": "success" if spf_record else "warning", "label": "SPF", "message": "SPF record found." if spf_record else "No SPF record found."})
+    email_health.append({"status": "success" if dmarc_record else "warning", "label": "DMARC", "message": "DMARC record found." if dmarc_record else "No DMARC record found."})
+    has_m365_dkim = any("onmicrosoft.com" in value for value in txt_values)
+    email_health.append({"status": "success" if has_m365_dkim else "secondary", "label": "DKIM", "message": "Possible Microsoft 365 DKIM-related TXT records found." if has_m365_dkim else "DKIM was not validated by this basic lookup."})
+
+    return {
+        "records": {"A": a_records, "MX": mx_records, "TXT": txt_records, "NS": ns_records, "DMARC": dmarc_records},
+        "email_health": email_health,
+        "dns_available": dns is not None,
+    }
+
+def get_asset_assignment(asset_id):
+    return AssetAssignment.query.filter_by(asset_id=asset_id).first()
+
+
 def active_org():
     org_id = session.get("active_org_id")
     return db.session.get(Organization, org_id) if org_id else None
@@ -338,6 +573,22 @@ def fetch_whois_fields(domain_name):
         "expires_on_str": exp_date.strftime("%Y-%m-%d") if exp_date else "",
     }
 
+@app.before_request
+def enforce_password_change():
+    allowed_endpoints = {
+        "login",
+        "login_mfa",
+        "logout",
+        "change_password",
+        "forgot_password",
+        "reset_password",
+        "static",
+    }
+
+    if current_user.is_authenticated and current_user.must_change_password:
+        if request.endpoint not in allowed_endpoints:
+            return redirect(url_for("change_password"))
+
 # ---------------- Auth ----------------
 LOCKOUT_THRESHOLD = 5
 LOCKOUT_MINUTES = 15
@@ -377,12 +628,19 @@ def login():
         user.last_login_at = datetime.utcnow()
         db.session.commit()
         login_user(user)
+        log_audit("login", "user", user.id, details="Successful login", user_id=user.id)
+
+        if user.must_change_password:
+            flash("You must change your password before continuing.", "warning")
+            return redirect(url_for("change_password"))
+
         return redirect(url_for("orgs"))
     return render_template("login.html")
 
 @app.route("/logout")
 @login_required
 def logout():
+    log_audit("logout", "user", current_user.id, details="User logged out")
     logout_user()
     session.pop("active_org_id", None)
     return redirect(url_for("login"))
@@ -482,7 +740,13 @@ def org_view(org_id):
     if not org:
         abort(404)
     session["active_org_id"] = org.id
-    return render_template("org_view.html", org=org)
+
+    next_url = request.args.get("next")
+    if next_url:
+        return redirect(next_url)
+
+    dashboard_data = get_dashboard_data(org.id)
+    return render_template("org_view.html", org=org, dashboard_data=dashboard_data)
 
 # ---------------- Passwords ----------------
 @app.route("/passwords")
@@ -504,11 +768,11 @@ def pw_new():
         p = Password(
             org_id=org.id,
             name=(request.form.get("name") or "").strip(),
-            username_plain=request.form.get("username") or None,
-            password_plain=request.form.get("password") or None,
+            username_plain=encrypt_secret(request.form.get("username") or None),
+            password_plain=encrypt_secret(request.form.get("password") or None),
             url=request.form.get("url") or None,
             notes=request.form.get("notes") or None,
-            otp_secret=(request.form.get("otp_secret") or "").strip() or None,
+            otp_secret=encrypt_secret((request.form.get("otp_secret") or "").strip() or None),
             updated_at=datetime.utcnow(),
             updated_by=current_user.id
         )
@@ -517,6 +781,7 @@ def pw_new():
             return render_template("pw_edit.html", org=org, row=None)
         db.session.add(p)
         db.session.commit()
+        log_audit("create", "password", p.id, org_id=org.id, details=f"Created password: {p.name}")
         flash("Password created.", "success")
         return redirect(url_for("pw_view", pw_id=p.id))
     return render_template("pw_edit.html", org=org, row=None)
@@ -545,17 +810,18 @@ def pw_edit(pw_id):
         )
         db.session.add(hist)
         row.name = (request.form.get("name") or "").strip()
-        row.username_plain = request.form.get("username") or None
-        row.password_plain = request.form.get("password") or None
+        row.username_plain = encrypt_secret(request.form.get("username") or None)
+        row.password_plain = encrypt_secret(request.form.get("password") or None)
         row.url = request.form.get("url") or None
         row.notes = request.form.get("notes") or None
-        row.otp_secret = (request.form.get("otp_secret") or "").strip() or None
+        row.otp_secret = encrypt_secret((request.form.get("otp_secret") or "").strip() or None)
         row.updated_at = datetime.utcnow()
         row.updated_by = current_user.id
         if not row.name:
             flash("Name required.", "warning")
             return render_template("pw_edit.html", org=org, row=row)
         db.session.commit()
+        log_audit("update", "password", row.id, org_id=org.id, details=f"Updated password: {row.name}")
         flash("Password updated.", "success")
         return redirect(url_for("pw_view", pw_id=row.id))
     return render_template("pw_edit.html", org=org, row=row)
@@ -630,7 +896,8 @@ def pw_secret(pw_id):
     row = db.session.get(Password, pw_id)
     if not org or not row or row.org_id != org.id:
         return jsonify({"error": "not found"}), 404
-    return jsonify({"username": row.username_plain or "", "password": row.password_plain or ""})
+    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
+    return jsonify({"username": decrypt_secret(row.username_plain), "password": decrypt_secret(row.password_plain), "otp_secret": decrypt_secret(row.otp_secret)})
 
 # ---------------- Domains ----------------
 @app.route("/domains")
@@ -686,7 +953,8 @@ def domain_view(domain_id):
     if not d or d.org_id != org.id:
         flash("Domain not found.", "danger")
         return redirect(url_for("domains_list"))
-    return render_template("domain_view.html", org=org, domain=d)
+    dns_snapshot = fetch_dns_snapshot(d.domain_name)
+    return render_template("domain_view.html", org=org, domain=d, dns_snapshot=dns_snapshot)
 
 @app.route("/domains/<int:domain_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -786,38 +1054,146 @@ def docs():
     org = require_active_org()
     if not org:
         return redirect(url_for("orgs"))
+
     folder_id = request.args.get("folder", type=int)
     cur = db.session.get(DocFolder, folder_id) if folder_id else None
     if cur and cur.org_id != org.id:
         flash("Folder not found.", "danger")
         return redirect(url_for("docs"))
+
     crumbs = []
     f = cur
     while f:
         crumbs.append(f)
         f = f.parent
     crumbs.reverse()
-    folders = DocFolder.query.filter_by(org_id=org.id, parent_id=cur.id if cur else None).order_by(DocFolder.name.asc()).all()
-    files = DocFile.query.filter_by(org_id=org.id, folder_id=cur.id if cur else None).order_by(DocFile.file_name.asc()).all()
-    return render_template("docs_list.html", org=org, folder=cur, breadcrumbs=crumbs, folders=folders, files=files)
 
-@app.route("/docs/folder/new", methods=["POST"])
+    folders = DocFolder.query.filter_by(
+        org_id=org.id,
+        parent_id=cur.id if cur else None
+    ).order_by(DocFolder.name.asc()).all()
+
+    pages = DocPage.query.filter_by(
+        org_id=org.id,
+        folder_id=cur.id if cur else None
+    ).order_by(DocPage.title.asc()).all()
+
+    files = DocFile.query.filter_by(
+        org_id=org.id,
+        folder_id=cur.id if cur else None
+    ).order_by(DocFile.file_name.asc()).all()
+
+    return render_template(
+        "docs_list.html",
+        org=org,
+        folder=cur,
+        breadcrumbs=crumbs,
+        folders=folders,
+        pages=pages,
+        files=files
+    )
+@app.route("/docs/page/new", methods=["GET", "POST"])
 @login_required
-def docs_folder_new():
+def docs_page_new():
     org = require_active_org()
     if not org:
         return redirect(url_for("orgs"))
-    name = (request.form.get("name") or "").strip()
-    parent_id = request.form.get("parent_id", type=int)
-    if not name:
-        flash("Folder name required.", "warning")
-        return redirect(url_for("docs", folder=parent_id))
-    folder = DocFolder(org_id=org.id, name=name, parent_id=parent_id or None)
-    db.session.add(folder)
-    db.session.commit()
-    flash("Folder created.", "success")
-    return redirect(url_for("docs", folder=parent_id))
 
+    folder_id = request.values.get("folder_id", type=int)
+    folder = db.session.get(DocFolder, folder_id) if folder_id else None
+    if folder and folder.org_id != org.id:
+        flash("Folder not found.", "danger")
+        return redirect(url_for("docs"))
+
+    if request.method == "POST":
+        title = (request.form.get("title") or "").strip()
+        body_html = request.form.get("body_html") or ""
+
+        if not title:
+            flash("Title is required.", "warning")
+            return render_template("doc_page_edit.html", org=org, row=None, folder=folder, body_html=body_html)
+
+        page = DocPage(
+            org_id=org.id,
+            folder_id=folder_id,
+            title=title,
+            body_html=body_html,
+            created_by=current_user.id,
+            updated_by=current_user.id,
+        )
+        db.session.add(page)
+        db.session.commit()
+        flash("Document page created.", "success")
+        return redirect(url_for("docs_page_view", page_id=page.id))
+
+    return render_template("doc_page_edit.html", org=org, row=None, folder=folder, body_html="")
+@app.route("/docs/page/<int:page_id>")
+@login_required
+def docs_page_view(page_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    page = db.session.get(DocPage, page_id)
+    if not page or page.org_id != org.id:
+        flash("Document page not found.", "danger")
+        return redirect(url_for("docs"))
+
+    return render_template("doc_page_view.html", org=org, page=page)
+@app.route("/docs/page/<int:page_id>/edit", methods=["GET", "POST"])
+@login_required
+def docs_page_edit(page_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    page = db.session.get(DocPage, page_id)
+    if not page or page.org_id != org.id:
+        flash("Document page not found.", "danger")
+        return redirect(url_for("docs"))
+
+    if request.method == "POST":
+        title = (request.form.get("title") or "").strip()
+        body_html = request.form.get("body_html") or ""
+        folder_id = request.form.get("folder_id", type=int)
+        folder = db.session.get(DocFolder, folder_id) if folder_id else None
+
+        if folder and folder.org_id != org.id:
+            flash("Folder not found.", "danger")
+            return redirect(url_for("docs"))
+
+        if not title:
+            flash("Title is required.", "warning")
+            return render_template("doc_page_edit.html", org=org, row=page, folder=folder, body_html=body_html)
+
+        page.title = title
+        page.body_html = body_html
+        page.folder_id = folder_id
+        page.updated_by = current_user.id
+        page.updated_at = datetime.utcnow()
+        db.session.commit()
+        flash("Document page saved.", "success")
+        return redirect(url_for("docs_page_view", page_id=page.id))
+
+    folder = db.session.get(DocFolder, page.folder_id) if page.folder_id else None
+    return render_template("doc_page_edit.html", org=org, row=page, folder=folder, body_html=page.body_html or "")
+@app.route("/docs/page/<int:page_id>/delete", methods=["POST"])
+@login_required
+def docs_page_delete(page_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    page = db.session.get(DocPage, page_id)
+    if not page or page.org_id != org.id:
+        flash("Document page not found.", "danger")
+        return redirect(url_for("docs"))
+
+    folder_id = page.folder_id
+    db.session.delete(page)
+    db.session.commit()
+    flash("Document page deleted.", "success")
+    return redirect(url_for("docs", folder=folder_id))
 @app.route("/docs/upload", methods=["POST"])
 @login_required
 def docs_upload():
@@ -1234,28 +1610,75 @@ def admin_users():
 @login_required
 def admin_users_new():
     super_admin_only()
+
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
         pw = request.form.get("password") or ""
         is_admin = True if request.form.get("is_admin") else False
         is_super_admin = True if request.form.get("is_super_admin") else False
+
         if not email or not pw:
             flash("Email and password required.", "warning")
             return render_template("admin_users_new.html")
+
         if not password_meets_policy(pw):
             flash("Password does not meet policy.", "warning")
             return render_template("admin_users_new.html")
+
         if User.query.filter_by(email=email).first():
             flash("User already exists.", "warning")
             return render_template("admin_users_new.html")
-        u = User(email=email, is_admin=is_admin, is_super_admin=is_super_admin, must_change_password=True)
+
+        u = User(
+            email=email,
+            is_admin=is_admin,
+            is_super_admin=is_super_admin,
+            must_change_password=True
+        )
         u.set_password(pw)
+
         db.session.add(u)
         db.session.commit()
-        flash("User created.", "success")
-        return redirect(url_for("admin_users"))
-    return render_template("admin_users_new.html")
 
+        log_audit(
+            "create",
+            "user",
+            u.id,
+            details=f"Created user: {u.email}",
+            user_id=current_user.id
+        )
+
+        # Send welcome email
+        try:
+            body = f"""Hello,
+
+Your CoreSight Vault account has been created.
+
+Login URL:
+{url_for('login', _external=True)}
+
+Username:
+{u.email}
+
+Temporary Password:
+{pw}
+
+For security reasons, you will be required to change this password on first login.
+
+If you were not expecting this account, please contact your administrator.
+
+Regards,
+CoreSight Vault
+"""
+            send_email(u.email, "Welcome to CoreSight Vault", body)
+            flash("User created and welcome email sent.", "success")
+
+        except Exception as e:
+            flash(f"User created, but email failed: {e}", "warning")
+
+        return redirect(url_for("admin_users"))
+
+    return render_template("admin_users_new.html")
 @app.route("/admin/smtp", methods=["GET", "POST"])
 @login_required
 def admin_smtp():
@@ -1301,6 +1724,287 @@ def admin_assets_config():
         flash("Asset config updated.", "success")
         return redirect(url_for("admin_assets_config"))
     return render_template("admin_assets_config.html", types=AssetType.query.order_by(AssetType.name.asc()).all(), brands=AssetBrand.query.order_by(AssetBrand.name.asc()).all())
+
+
+# ---------------- Dashboard / Audit / Asset Extensions ----------------
+@app.route("/dashboard/data")
+@login_required
+def dashboard_data():
+    org = require_active_org()
+    if not org:
+        return jsonify({"error": "no active org"}), 400
+    return jsonify(get_dashboard_data(org.id))
+
+@app.route("/audit/logs")
+@login_required
+def audit_logs():
+    org = active_org()
+    qs = AuditLog.query
+    if org:
+        qs = qs.filter(db.or_(AuditLog.org_id == org.id, AuditLog.org_id.is_(None)))
+    rows = qs.order_by(AuditLog.created_at.desc()).limit(100).all()
+    return jsonify({
+        "results": [
+            {
+                "id": r.id,
+                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "action": r.action,
+                "entity_type": r.entity_type,
+                "entity_id": r.entity_id,
+                "details": r.details or "",
+                "user_id": r.user_id,
+                "org_id": r.org_id,
+            }
+            for r in rows
+        ]
+    })
+
+@app.route("/assets/<int:asset_id>/assignment", methods=["GET", "POST"])
+@login_required
+def asset_assignment(asset_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    asset = db.session.get(Asset, asset_id)
+    if not asset or asset.org_id != org.id:
+        return jsonify({"error": "asset not found"}), 404
+
+    assignment = get_asset_assignment(asset_id)
+
+    if request.method == "GET":
+        return jsonify({
+            "asset_id": asset.id,
+            "asset_name": asset.device_name,
+            "assignment": {
+                "site_id": assignment.site_id if assignment else None,
+                "contact_id": assignment.contact_id if assignment else None,
+                "status": assignment.status if assignment else "active",
+                "notes": assignment.notes if assignment else "",
+            }
+        })
+
+    site_id = request.form.get("site_id", type=int)
+    contact_id = request.form.get("contact_id", type=int)
+    status = (request.form.get("status") or "active").strip()
+    notes = (request.form.get("notes") or "").strip() or None
+
+    if site_id:
+        site = db.session.get(SiteAddress, site_id)
+        if not site or site.org_id != org.id:
+            return jsonify({"error": "invalid site"}), 400
+
+    if contact_id:
+        contact = db.session.get(SiteContact, contact_id)
+        if not contact or contact.org_id != org.id:
+            return jsonify({"error": "invalid contact"}), 400
+
+    if assignment is None:
+        assignment = AssetAssignment(asset_id=asset.id)
+        db.session.add(assignment)
+
+    assignment.site_id = site_id
+    assignment.contact_id = contact_id
+    assignment.status = status
+    assignment.notes = notes
+    assignment.updated_by = current_user.id
+    db.session.commit()
+
+    log_audit("assign", "asset", asset.id, org_id=org.id, details=f"Updated asset assignment/status to {status}")
+    return jsonify({"success": True})
+
+#------+Search-------
+@app.route("/search/global")
+@login_required
+def global_search():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"results": []})
+
+    def org_name(org_id):
+        org = db.session.get(Organization, org_id)
+        return org.name if org else "Unknown organisation"
+
+    results = []
+
+    org_rows = Organization.query.filter(
+        db.or_(
+            Organization.name.ilike(f"%{q}%"),
+            Organization.description.ilike(f"%{q}%")
+        )
+    ).limit(15).all()
+
+    for row in org_rows:
+        results.append({
+            "type": "Organisation",
+            "title": row.name,
+            "subtitle": row.description or "",
+            "snippet": _snippet(row.description or "", q),
+            "org_name": row.name,
+            "url": url_for("org_view", org_id=row.id),
+        })
+
+    pw_rows = Password.query.filter(
+        db.or_(
+            Password.name.ilike(f"%{q}%"),
+            Password.url.ilike(f"%{q}%"),
+            Password.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in pw_rows:
+        results.append({
+            "type": "Password",
+            "title": row.name,
+            "subtitle": decrypt_secret(row.username_plain) or row.url or "",
+            "snippet": _snippet((row.notes or "") + " " + (row.url or ""), q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('pw_view', pw_id=row.id)}",
+        })
+
+    domain_rows = Domain.query.filter(
+        db.or_(
+            Domain.domain_name.ilike(f"%{q}%"),
+            Domain.registrar.ilike(f"%{q}%"),
+            Domain.dns_provider.ilike(f"%{q}%"),
+            Domain.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in domain_rows:
+        results.append({
+            "type": "Domain",
+            "title": row.domain_name,
+            "subtitle": row.registrar or row.dns_provider or "",
+            "snippet": _snippet(row.notes or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('domain_view', domain_id=row.id)}",
+        })
+
+    contact_rows = SiteContact.query.filter(
+        db.or_(
+            SiteContact.first_name.ilike(f"%{q}%"),
+            SiteContact.last_name.ilike(f"%{q}%"),
+            SiteContact.email.ilike(f"%{q}%"),
+            SiteContact.mobile.ilike(f"%{q}%"),
+            SiteContact.office.ilike(f"%{q}%"),
+            SiteContact.position.ilike(f"%{q}%"),
+            SiteContact.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in contact_rows:
+        results.append({
+            "type": "Contact",
+            "title": f"{row.first_name} {row.last_name}".strip(),
+            "subtitle": row.email or row.position or "",
+            "snippet": _snippet(row.notes or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('contact_view', contact_id=row.id)}",
+        })
+
+    site_rows = SiteAddress.query.filter(
+        db.or_(
+            SiteAddress.site_name.ilike(f"%{q}%"),
+            SiteAddress.address1.ilike(f"%{q}%"),
+            SiteAddress.address2.ilike(f"%{q}%"),
+            SiteAddress.suburb.ilike(f"%{q}%"),
+            SiteAddress.state.ilike(f"%{q}%"),
+            SiteAddress.postcode.ilike(f"%{q}%"),
+            SiteAddress.country.ilike(f"%{q}%"),
+            SiteAddress.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in site_rows:
+        results.append({
+            "type": "Site",
+            "title": row.site_name,
+            "subtitle": ", ".join(filter(None, [row.suburb, row.state, row.postcode])),
+            "snippet": _snippet(" ".join(filter(None, [row.address1, row.address2, row.notes])), q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('site_view', site_id=row.id)}",
+        })
+
+    network_rows = NetworkDevice.query.filter(
+        db.or_(
+            NetworkDevice.device_name.ilike(f"%{q}%"),
+            NetworkDevice.ip_address.ilike(f"%{q}%"),
+            NetworkDevice.mac_address.ilike(f"%{q}%"),
+            NetworkDevice.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in network_rows:
+        results.append({
+            "type": "Network",
+            "title": row.device_name,
+            "subtitle": row.ip_address or row.mac_address or "",
+            "snippet": _snippet(row.notes or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id),
+        })
+
+    asset_rows = Asset.query.filter(
+        db.or_(
+            Asset.device_name.ilike(f"%{q}%"),
+            Asset.device_type.ilike(f"%{q}%"),
+            Asset.brand.ilike(f"%{q}%"),
+            Asset.serial_number.ilike(f"%{q}%"),
+            Asset.asset_id.ilike(f"%{q}%"),
+            Asset.location.ilike(f"%{q}%"),
+            Asset.issued_to.ilike(f"%{q}%"),
+            Asset.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in asset_rows:
+        results.append({
+            "type": "Asset",
+            "title": row.device_name,
+            "subtitle": row.serial_number or row.asset_id or row.device_type or "",
+            "snippet": _snippet(row.notes or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('asset_view', asset_id=row.id)}",
+        })
+
+    doc_files = DocFile.query.filter(
+        db.or_(
+            DocFile.file_name.ilike(f"%{q}%"),
+            DocFile.notes.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in doc_files:
+        results.append({
+            "type": "File",
+            "title": row.file_name,
+            "subtitle": "Uploaded file",
+            "snippet": _snippet(row.notes or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('docs_file_view', file_id=row.id)}",
+        })
+
+    page_rows = DocPage.query.filter(
+        db.or_(
+            DocPage.title.ilike(f"%{q}%"),
+            DocPage.body_html.ilike(f"%{q}%"),
+        )
+    ).limit(20).all()
+
+    for row in page_rows:
+        results.append({
+            "type": "Document",
+            "title": row.title,
+            "subtitle": "Rich text document",
+            "snippet": _snippet(row.body_html or "", q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('docs_page_view', page_id=row.id)}",
+        })
+
+    results = sorted(results, key=lambda x: (x["type"], x["title"].lower()))
+    return jsonify({"results": results[:75]})
+
 
 # ---------------- Init ----------------
 def seed_defaults():

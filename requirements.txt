@@ -1,0 +1,25 @@
+Flask==3.0.3
+Flask-Login==0.6.3
+Flask-SQLAlchemy==3.1.1
+Flask-Mail==0.9.1
+
+SQLAlchemy==2.0.30
+Werkzeug==3.0.3
+Jinja2==3.1.4
+itsdangerous==2.2.0
+
+python-dotenv==1.0.1
+email-validator==2.1.1
+
+# MFA (TOTP)
+pyotp==2.9.0
+
+# QR Code generation (for MFA setup)
+qrcode==7.4.2
+Pillow==10.3.0
+
+# HTTP requests (DNS lookups / future APIs)
+requests==2.32.3
+
+# Optional but recommended for production
+gunicorn==22.0.0

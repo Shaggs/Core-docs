@@ -1,1 +1,246 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">{{ row.name }}</h2><div class="card shadow-sm p-3 mb-3"><div class="row mb-3"><div class="col-md-3"><strong>URL</strong></div><div class="col-md-9">{{ row.url or "—" }}</div></div><div class="row mb-3"><div class="col-md-3"><strong>Notes</strong></div><div class="col-md-9">{{ row.notes or "—" }}</div></div><div class="row mb-3"><div class="col-md-3"><strong>Last Updated</strong></div><div class="col-md-9">{% if row.updated_at %}{{ row.updated_at.strftime("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</div></div><div class="row mb-3"><div class="col-md-3"><strong>Updated By</strong></div><div class="col-md-9">{% if row.updated_by_user %}{{ row.updated_by_user.email }}{% else %}—{% endif %}</div></div><div class="mb-3"><button id="revealBtn" class="btn btn-sm btn-outline-secondary">Reveal & Copy</button></div><a href="{{ url_for('pw_edit', pw_id=row.id) }}" class="btn btn-primary">Edit</a><a href="{{ url_for('pw_list') }}" class="btn btn-secondary">Back</a><form method="post" action="{{ url_for('pw_delete', pw_id=row.id) }}" class="d-inline" onsubmit="return confirm('Delete this password?');"><button class="btn btn-outline-danger">Delete</button></form></div><div class="card shadow-sm p-3"><h5 class="mb-3">History</h5>{% if history %}<div class="table-responsive"><table class="table table-sm table-hover"><thead><tr><th>Date</th><th>Changed By</th><th>Name</th><th>Username</th><th>URL</th><th></th></tr></thead><tbody>{% for h in history %}<tr><td>{{ h.changed_at.strftime("%Y-%m-%d %H:%M") }}</td><td>{% if h.changed_by_user %}{{ h.changed_by_user.email }}{% else %}—{% endif %}</td><td>{{ h.name }}</td><td>{{ h.username_plain or "—" }}</td><td>{{ h.url or "—" }}</td><td><form method="post" action="{{ url_for('pw_rollback', pw_id=row.id, history_id=h.id) }}" onsubmit="return confirm('Rollback to this version?');"><button class="btn btn-sm btn-outline-warning">Rollback</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="text-muted mb-0">No history yet.</p>{% endif %}</div><script>async function getSecrets(){const r=await fetch("{{ url_for('pw_secret', pw_id=row.id) }}");const j=await r.json();if(j.username||j.password){await navigator.clipboard.writeText(`${j.username||''}\n${j.password||''}`.trim());alert("Username & password copied to clipboard.");} else {alert("No secret stored.");}}document.getElementById("revealBtn").addEventListener("click", getSecrets);</script>{% endblock %}
+{% extends "base.html" %}
+
+{% block content %}
+<h2 class="mb-3">{{ row.name }}</h2>
+
+<div class="card shadow-sm p-3 mb-3">
+  <div class="row mb-3">
+    <div class="col-md-3"><strong>URL</strong></div>
+    <div class="col-md-9">
+      {% if row.url %}
+        <a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.url }}</a>
+      {% else %}
+        —
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="row mb-3 align-items-center">
+    <div class="col-md-3"><strong>Username</strong></div>
+    <div class="col-md-7">
+      <input type="text" id="usernameField" class="form-control" readonly value="">
+    </div>
+    <div class="col-md-2 mt-2 mt-md-0">
+      <button type="button" class="btn btn-outline-secondary btn-sm w-100" onclick="copyField('usernameField', 'Username copied to clipboard.')">
+        Copy
+      </button>
+    </div>
+  </div>
+
+  <div class="row mb-3 align-items-center">
+    <div class="col-md-3"><strong>Password</strong></div>
+    <div class="col-md-5">
+      <input type="password" id="passwordField" class="form-control" readonly value="">
+    </div>
+    <div class="col-md-2 mt-2 mt-md-0">
+      <button type="button" id="togglePassword" class="btn btn-outline-secondary btn-sm w-100">
+        Reveal
+      </button>
+    </div>
+    <div class="col-md-2 mt-2 mt-md-0">
+      <button type="button" class="btn btn-outline-secondary btn-sm w-100" onclick="copyField('passwordField', 'Password copied to clipboard.')">
+        Copy
+      </button>
+    </div>
+  </div>
+
+  <div class="row mb-3 align-items-center">
+    <div class="col-md-3"><strong>OTP Code</strong></div>
+    <div class="col-md-7">
+      <input type="text" id="otpField" class="form-control" readonly value="" placeholder="No OTP configured">
+      <small id="otpTimer" class="text-muted d-block mt-1"></small>
+    </div>
+    <div class="col-md-2 mt-2 mt-md-0">
+      <button type="button" class="btn btn-outline-secondary btn-sm w-100" onclick="copyField('otpField', 'OTP code copied to clipboard.')">
+        Copy
+      </button>
+    </div>
+  </div>
+
+  <div class="row mb-3">
+    <div class="col-md-3"><strong>Notes</strong></div>
+    <div class="col-md-9">{{ row.notes or "—" }}</div>
+  </div>
+
+  <div class="row mb-3">
+    <div class="col-md-3"><strong>Last Updated</strong></div>
+    <div class="col-md-9">
+      {% if row.updated_at %}
+        {{ row.updated_at.strftime("%Y-%m-%d %H:%M") }}
+      {% else %}
+        —
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="row mb-3">
+    <div class="col-md-3"><strong>Updated By</strong></div>
+    <div class="col-md-9">
+      {% if row.updated_by_user %}
+        {{ row.updated_by_user.email }}
+      {% else %}
+        —
+      {% endif %}
+    </div>
+  </div>
+
+  <a href="{{ url_for('pw_edit', pw_id=row.id) }}" class="btn btn-primary">Edit</a>
+  <a href="{{ url_for('pw_list') }}" class="btn btn-secondary">Back</a>
+  <form method="post" action="{{ url_for('pw_delete', pw_id=row.id) }}" class="d-inline" onsubmit="return confirm('Delete this password?');">
+    <button class="btn btn-outline-danger">Delete</button>
+  </form>
+</div>
+
+<div class="card shadow-sm p-3">
+  <h5 class="mb-3">History</h5>
+
+  {% if history %}
+    <div class="table-responsive">
+      <table class="table table-sm table-hover">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Changed By</th>
+            <th>Name</th>
+            <th>Username</th>
+            <th>URL</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for h in history %}
+            <tr>
+              <td>{{ h.changed_at.strftime("%Y-%m-%d %H:%M") }}</td>
+              <td>
+                {% if h.changed_by_user %}
+                  {{ h.changed_by_user.email }}
+                {% else %}
+                  —
+                {% endif %}
+              </td>
+              <td>{{ h.name }}</td>
+              <td>{{ h.username_plain or "—" }}</td>
+              <td>{{ h.url or "—" }}</td>
+              <td>
+                <form method="post" action="{{ url_for('pw_rollback', pw_id=row.id, history_id=h.id) }}" onsubmit="return confirm('Rollback to this version?');">
+                  <button class="btn btn-sm btn-outline-warning">Rollback</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="text-muted mb-0">No history yet.</p>
+  {% endif %}
+</div>
+
+<script>
+let otpCountdownInterval = null;
+let otpRefreshTimeout = null;
+
+async function loadSecrets() {
+  try {
+    const response = await fetch("{{ url_for('pw_secret', pw_id=row.id) }}");
+    const data = await response.json();
+
+    if (!response.ok || data.error) {
+      document.getElementById("usernameField").value = "";
+      document.getElementById("passwordField").value = "";
+      document.getElementById("otpField").value = "";
+      document.getElementById("otpTimer").textContent = "Unable to load secrets.";
+      return;
+    }
+
+    document.getElementById("usernameField").value = data.username || "";
+    document.getElementById("passwordField").value = data.password || "";
+
+    if (data.otp_enabled && data.otp) {
+      document.getElementById("otpField").value = data.otp;
+      startOtpCountdown(data.otp_seconds_remaining);
+    } else {
+      document.getElementById("otpField").value = "";
+      document.getElementById("otpTimer").textContent = "No OTP configured.";
+      stopOtpTimers();
+    }
+  } catch (error) {
+    document.getElementById("otpTimer").textContent = "Failed to load secrets.";
+  }
+}
+
+function copyField(fieldId, successMessage) {
+  const el = document.getElementById(fieldId);
+  if (!el || !el.value) {
+    alert("Nothing to copy.");
+    return;
+  }
+
+  navigator.clipboard.writeText(el.value)
+    .then(() => {
+      alert(successMessage);
+    })
+    .catch(() => {
+      alert("Copy failed.");
+    });
+}
+
+function stopOtpTimers() {
+  if (otpCountdownInterval) {
+    clearInterval(otpCountdownInterval);
+    otpCountdownInterval = null;
+  }
+  if (otpRefreshTimeout) {
+    clearTimeout(otpRefreshTimeout);
+    otpRefreshTimeout = null;
+  }
+}
+
+function startOtpCountdown(secondsRemaining) {
+  stopOtpTimers();
+
+  const timerEl = document.getElementById("otpTimer");
+  let remaining = typeof secondsRemaining === "number" ? secondsRemaining : 30;
+
+  function renderTimer() {
+    if (remaining <= 0) {
+      timerEl.textContent = "Refreshing code...";
+      return;
+    }
+    timerEl.textContent = `Code refreshes in ${remaining}s`;
+  }
+
+  renderTimer();
+
+  otpCountdownInterval = setInterval(() => {
+    remaining -= 1;
+    renderTimer();
+
+    if (remaining <= 0) {
+      clearInterval(otpCountdownInterval);
+      otpCountdownInterval = null;
+    }
+  }, 1000);
+
+  otpRefreshTimeout = setTimeout(() => {
+    loadSecrets();
+  }, Math.max(remaining, 1) * 1000);
+}
+
+document.getElementById("togglePassword").addEventListener("click", function () {
+  const field = document.getElementById("passwordField");
+
+  if (field.type === "password") {
+    field.type = "text";
+    this.textContent = "Hide";
+  } else {
+    field.type = "password";
+    this.textContent = "Reveal";
+  }
+});
+
+document.addEventListener("DOMContentLoaded", function () {
+  loadSecrets();
+});
+</script>
+{% endblock %}
