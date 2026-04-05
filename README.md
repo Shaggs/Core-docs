@@ -84,7 +84,7 @@ Built with Flask, CoreSight Vault provides a lightweight alternative to tools li
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/coresight-vault.git
+git clone https://github.com/Shaggs/Core-docs.git
 cd coresight-vault
 python3 -m venv .venv
 source .venv/bin/activate
