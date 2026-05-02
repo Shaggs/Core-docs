@@ -6,6 +6,12 @@ import hashlib
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 from pathlib import Path
+import io
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
@@ -56,6 +62,44 @@ ALLOWED_EXTS = {"pdf","doc","docx","xls","xlsx","ppt","pptx","txt","jpg","jpeg",
 
 # ---------------- Models ----------------
 
+class OnboardingRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False, unique=True, index=True)
+
+    welcome_package_given = db.Column(db.Boolean, default=False)
+    welcome_package_given_by = db.Column(db.String(200))
+    welcome_package_given_on = db.Column(db.Date)
+
+    site_contact_established = db.Column(db.Boolean, default=False)
+    site_contact_established_by = db.Column(db.String(200))
+    site_contact_established_on = db.Column(db.Date)
+
+    rmm_installed = db.Column(db.Boolean, default=False)
+    rmm_installed_by = db.Column(db.String(200))
+    rmm_installed_on = db.Column(db.Date)
+
+    m365_or_google_admin_created = db.Column(db.Boolean, default=False)
+    m365_or_google_admin_created_by = db.Column(db.String(200))
+    m365_or_google_admin_created_on = db.Column(db.Date)
+
+    domain_taken_over = db.Column(db.Boolean, default=False)
+    domain_taken_over_by = db.Column(db.String(200))
+    domain_taken_over_on = db.Column(db.Date)
+
+    network_scoped = db.Column(db.Boolean, default=False)
+    network_scoped_by = db.Column(db.String(200))
+    network_scoped_on = db.Column(db.Date)
+
+    passwords_uploaded = db.Column(db.Boolean, default=False)
+    passwords_uploaded_by = db.Column(db.String(200))
+    passwords_uploaded_on = db.Column(db.Date)
+
+    backups_set = db.Column(db.Boolean, default=False)
+    backups_set_by = db.Column(db.String(200))
+    backups_set_on = db.Column(db.Date)
+
+    notes = db.Column(db.Text)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 class DocPage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False)
@@ -70,6 +114,7 @@ class DocPage(db.Model):
     folder = db.relationship("DocFolder", backref="pages")
     created_by_user = db.relationship("User", foreign_keys=[created_by])
     updated_by_user = db.relationship("User", foreign_keys=[updated_by])
+
 class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(320), unique=True, nullable=False, index=True)
@@ -341,8 +386,20 @@ def get_dashboard_data(org_id):
     password_count = Password.query.filter_by(org_id=org_id).count()
     contact_count = SiteContact.query.filter_by(org_id=org_id).count()
     asset_count = Asset.query.filter_by(org_id=org_id).count()
+    onboarding = OnboardingRecord.query.filter_by(org_id=org_id).first()
+    onboarding_done = 0
+    onboarding_total = len(ONBOARDING_FIELDS)
+    onboarding_percent = 0
+
+    if onboarding:
+        onboarding_done, onboarding_total, onboarding_percent = onboarding_progress(onboarding)
 
     return {
+            "onboarding": {
+            "done": onboarding_done,
+            "total": onboarding_total,
+            "percent": onboarding_percent,
+        },
         "counts": {
             "passwords": password_count,
             "documents": docs_count,
@@ -589,6 +646,158 @@ def enforce_password_change():
         if request.endpoint not in allowed_endpoints:
             return redirect(url_for("change_password"))
 
+ONBOARDING_FIELDS = [
+    ("welcome_package_given", "Welcome package given"),
+    ("site_contact_established", "Site contact established"),
+    ("rmm_installed", "RMM installed"),
+    ("m365_or_google_admin_created", "M365/Google admin created"),
+    ("domain_taken_over", "Domain taken over"),
+    ("network_scoped", "Network scoped"),
+    ("passwords_uploaded", "Passwords uploaded"),
+    ("backups_set", "Backups set"),
+]
+
+def get_or_create_onboarding(org_id):
+    row = OnboardingRecord.query.filter_by(org_id=org_id).first()
+    if not row:
+        row = OnboardingRecord(org_id=org_id)
+        db.session.add(row)
+        db.session.commit()
+    return row
+
+def onboarding_progress(row):
+    total = len(ONBOARDING_FIELDS)
+    done = sum(1 for field, _label in ONBOARDING_FIELDS if getattr(row, field, False))
+    percent = int(round((done / total) * 100)) if total else 0
+    return done, total, percent
+
+@app.route("/onboarding", methods=["GET", "POST"])
+@login_required
+def onboarding_view():
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    row = get_or_create_onboarding(org.id)
+
+    if request.method == "POST":
+        row.actioned_by = (request.form.get("actioned_by") or "").strip() or None
+
+        actioned_on = (request.form.get("actioned_on") or "").strip()
+        row.actioned_on = None
+        if actioned_on:
+            try:
+                row.actioned_on = datetime.strptime(actioned_on, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Actioned date must be YYYY-MM-DD.", "warning")
+                return render_template(
+                    "onboarding.html",
+                    org=org,
+                    row=row,
+                    onboarding_fields=ONBOARDING_FIELDS,
+                    progress=onboarding_progress(row)
+                )
+
+        for field, _label in ONBOARDING_FIELDS:
+            is_checked = request.form.get(field) == "on"
+            setattr(row, field, is_checked)
+
+            # Per item metadata
+            by_value = request.form.get(f"{field}_by")
+            on_value = request.form.get(f"{field}_on")
+
+            setattr(row, f"{field}_by", by_value or None)
+
+            if on_value:
+                try:
+                    setattr(row, f"{field}_on", datetime.strptime(on_value, "%Y-%m-%d").date())
+                except ValueError:
+                    setattr(row, f"{field}_on", None)
+            else:
+                setattr(row, f"{field}_on", None)
+        row.notes = (request.form.get("notes") or "").strip() or None
+        row.updated_at = datetime.utcnow()
+
+        db.session.commit()
+        flash("Onboarding checklist saved.", "success")
+        return redirect(url_for("onboarding_view"))
+
+    return render_template(
+        "onboarding.html",
+        org=org,
+        row=row,
+        onboarding_fields=ONBOARDING_FIELDS,
+        progress=onboarding_progress(row)
+    )
+
+
+@app.route("/onboarding/pdf")
+@login_required
+def onboarding_export_pdf():
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    row = get_or_create_onboarding(org.id)
+    done, total, percent = onboarding_progress(row)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=30,
+        bottomMargin=30
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"Onboarding Checklist - {org.name}", styles["Title"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"<b>Progress:</b> {done} / {total} ({percent}%)", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    data = [["Item", "Status", "Actioned By", "Actioned On"]]
+    for field, label in ONBOARDING_FIELDS:
+        is_complete = getattr(row, field, False)
+        by_value = getattr(row, f"{field}_by", None) or "-"
+        on_value = getattr(row, f"{field}_on", None)
+        on_text = on_value.strftime("%d-%m-%Y") if on_value else "-"
+
+        data.append([
+            label,
+            "Complete" if is_complete else "Pending",
+            by_value,
+            on_text
+        ])
+
+    table = Table(data, colWidths=[240, 80, 110, 90])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightyellow]),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 16))
+
+    story.append(Paragraph("<b>Notes</b>", styles["Heading3"]))
+    story.append(Paragraph((row.notes or "No notes added.").replace("\n", "<br/>"), styles["Normal"]))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    safe_name = "".join(c for c in org.name if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_")
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"{safe_name}_onboarding_checklist.pdf",
+        mimetype="application/pdf"
+    )
+
 # ---------------- Auth ----------------
 LOCKOUT_THRESHOLD = 5
 LOCKOUT_MINUTES = 15
@@ -699,6 +908,8 @@ def account():
 @login_required
 def setup_2fa():
     return render_template("setup_2fa.html")
+#-----------------Onboarding------------
+
 
 # ---------------- Orgs ----------------
 @app.route("/home/reset")
@@ -747,6 +958,29 @@ def org_view(org_id):
 
     dashboard_data = get_dashboard_data(org.id)
     return render_template("org_view.html", org=org, dashboard_data=dashboard_data)
+
+
+@app.route("/orgs/<int:org_id>/edit", methods=["GET", "POST"])
+@login_required
+def org_edit(org_id):
+    super_admin_only()
+    org = db.session.get(Organization, org_id)
+    if not org:
+        abort(404)
+
+    if request.method == "POST":
+        org.name = (request.form.get("name") or "").strip()
+        org.description = (request.form.get("description") or "").strip() or None
+
+        if not org.name:
+            flash("Name is required.", "warning")
+            return render_template("org_edit.html", org=org)
+
+        db.session.commit()
+        flash("Organisation saved.", "success")
+        return redirect(url_for("org_view", org_id=org.id))
+
+    return render_template("org_edit.html", org=org)
 
 # ---------------- Passwords ----------------
 @app.route("/passwords")
@@ -1280,6 +1514,39 @@ def docs_folder_delete(folder_id):
     flash("Folder deleted.", "success")
     return redirect(url_for("docs", folder=parent_id))
 
+@app.route("/org/<int:org_id>/docs/folder/new", methods=["GET", "POST"])
+@login_required
+def docs_folder_new(org_id):
+    org = db.session.get(Organization, org_id)
+    if not org:
+        abort(404)
+
+    if request.method == "POST":
+        folder_name = (request.form.get("folder_name") or "").strip()
+        parent_id = request.form.get("parent_id", type=int)
+
+        if not folder_name:
+            flash("Folder name is required.", "danger")
+            return redirect(url_for("docs_folder_new", org_id=org_id))
+
+        parent = db.session.get(DocFolder, parent_id) if parent_id else None
+        if parent and parent.org_id != org_id:
+            flash("Parent folder not found.", "danger")
+            return redirect(url_for("docs", folder=parent_id))
+
+        folder = DocFolder(
+            org_id=org_id,
+            name=folder_name,
+            parent_id=parent_id
+        )
+        db.session.add(folder)
+        db.session.commit()
+
+        flash("Folder created successfully.", "success")
+        return redirect(url_for("docs", folder=parent_id))
+
+    parent_id = request.args.get("parent_id", type=int)
+    return render_template("docs_folder_new.html", org=org, org_id=org_id, parent_id=parent_id)
 # ---------------- Contacts ----------------
 @app.route("/contacts")
 @login_required

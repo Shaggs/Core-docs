@@ -17,7 +17,7 @@
 
 <div class="row g-3 mb-3">
   <div class="col-lg-4">
-    <form method="post" action="{{ url_for('docs_folder_new') }}" class="card card-body shadow-sm h-100">
+    <form method="post" action="{{ url_for('docs_folder_new', org_id=org.id) }}" class="card card-body shadow-sm h-100">
       <input type="hidden" name="parent_id" value="{{ folder.id if folder else '' }}">
       <label class="form-label">New Folder</label>
       <div class="input-group">
