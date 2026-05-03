@@ -7,7 +7,8 @@ from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 from pathlib import Path
 import io
-
+import pyotp
+import qrcode
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -128,6 +129,7 @@ class User(db.Model, UserMixin):
     locked_until = db.Column(db.DateTime, nullable=True)
     must_change_password = db.Column(db.Boolean, default=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
+
 
 
     def set_password(self, raw):
@@ -296,6 +298,25 @@ def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 # ---------------- Helpers ----------------
+def build_totp_uri(user_email, secret):
+    return pyotp.TOTP(secret).provisioning_uri(
+        name=user_email,
+        issuer_name="CoreSight Vault"
+    )
+
+
+def verify_totp_code(secret, code):
+    if not secret or not code:
+        return False
+    return pyotp.TOTP(secret).verify(str(code).strip(), valid_window=1)
+
+
+def make_qr_data_uri(text):
+    img = qrcode.make(text)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
 
 def generate_totp_code(secret):
     if not secret:
@@ -868,6 +889,10 @@ def login():
         user.locked_until = None
         user.last_login_at = datetime.utcnow()
         db.session.commit()
+        if user.is_totp_enabled and user.totp_secret:
+            session["preauth_user_id"] = user.id
+            flash("Enter your MFA code to continue.", "info")
+            return redirect(url_for("login_mfa"))
         login_user(user)
         log_audit("login", "user", user.id, details="Successful login", user_id=user.id)
 
@@ -998,6 +1023,36 @@ def admin_user_edit(user_id):
         return redirect(url_for("admin_users"))
 
     return render_template("admin_user_edit.html", edit_user=edit_user)
+
+@app.route("/login/mfa", methods=["GET", "POST"])
+def login_mfa():
+    user_id = session.get("preauth_user_id")
+
+    if not user_id:
+        flash("Login expired. Please sign in again.", "warning")
+        return redirect(url_for("login"))
+
+    user = db.session.get(User, user_id)
+
+    if not user:
+        session.pop("preauth_user_id", None)
+        flash("User not found.", "danger")
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        code = request.form.get("code") or ""
+
+        if not verify_totp_code(user.totp_secret, code):
+            flash("Invalid MFA code.", "danger")
+            return render_template("login_mfa.html", email=user.email)
+
+        session.pop("preauth_user_id", None)
+
+        login_user(user)
+        flash("Login successful.", "success")
+        return redirect(url_for("orgs"))
+
+    return render_template("login_mfa.html", email=user.email)
 
 @app.route("/account", methods=["GET", "POST"])
 @login_required
