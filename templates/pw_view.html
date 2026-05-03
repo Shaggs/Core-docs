@@ -48,8 +48,7 @@
     <div class="mb-3">
       <label class="form-label fw-semibold">Username</label>
       <div class="input-group">
-        <input id="usernameField" type="password" class="form-control" value="Hidden" readonly>
-        <button type="button" class="btn btn-outline-secondary" onclick="revealSecrets()">Reveal</button>
+        <input id="usernameField" type="text" class="form-control" value="" readonly>
         <button type="button" class="btn btn-outline-secondary" onclick="copyField('usernameField')">Copy</button>
       </div>
     </div>
@@ -135,9 +134,8 @@ async function revealSecrets() {
       return;
     }
 
-    const usernameField = document.getElementById("usernameField");
-    usernameField.type = "text";
-    usernameField.value = data.username || "";
+  document.getElementById("usernameField").value =
+  data.username || "";
 
     const passwordField = document.getElementById("passwordField");
     passwordField.type = "password";
@@ -183,6 +181,7 @@ function copyField(id) {
 
 document.addEventListener("DOMContentLoaded", function () {
   loadOtp();
+  revealSecrets();
   setInterval(updateOtpTimer, 1000);
   otpInterval = setInterval(loadOtp, 30000);
 });
