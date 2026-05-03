@@ -122,11 +122,13 @@ class User(db.Model, UserMixin):
     is_admin = db.Column(db.Boolean, default=False)
     is_super_admin = db.Column(db.Boolean, default=False, nullable=False)
     is_totp_enabled = db.Column(db.Boolean, default=False)
+    is_active_user = db.Column(db.Boolean, default=True, nullable=False)
     totp_secret = db.Column(db.String(64), nullable=True)
     failed_logins = db.Column(db.Integer, default=0)
     locked_until = db.Column(db.DateTime, nullable=True)
     must_change_password = db.Column(db.Boolean, default=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
+
 
     def set_password(self, raw):
         self.password_hash = generate_password_hash(raw)
@@ -294,6 +296,31 @@ def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 # ---------------- Helpers ----------------
+
+def generate_totp_code(secret):
+    if not secret:
+        return None
+
+    try:
+        import pyotp
+
+        clean_secret = (
+            decrypt_secret(secret)
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("\n", "")
+            .strip()
+            .upper()
+        )
+
+        if not clean_secret:
+            return None
+
+        return pyotp.TOTP(clean_secret).now()
+
+    except Exception as e:
+        print("TOTP ERROR:", e)
+        return None
 
 def _snippet(text, q, radius=80):
     if not text:
@@ -822,6 +849,11 @@ def login():
         if not user:
             flash("Invalid credentials.", "danger")
             return render_template("login.html")
+        
+        if not getattr(user, "is_active_user", True):
+            flash("This account has been disabled.", "danger")
+            return render_template("login.html")
+        
         if is_locked(user) and not user.is_super_admin:
             flash("Account is temporarily locked.", "danger")
             return render_template("login.html")
@@ -899,15 +931,113 @@ def reset_password(token):
         return redirect(url_for("login"))
     return render_template("reset_password.html")
 
-@app.route("/account")
+@app.route("/change-password", methods=["GET", "POST"])
 @login_required
-def account():
-    return render_template("account.html")
+def change_password():
+    if request.method == "POST":
+        new_password = request.form.get("password")
+        confirm_password = request.form.get("confirm_password")
+
+        if not new_password or new_password != confirm_password:
+            flash("Passwords do not match.", "danger")
+            return render_template("change_password.html")
+
+        current_user.set_password(new_password)
+        current_user.must_change_password = False
+        db.session.commit()
+
+        flash("Password changed successfully.", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("change_password.html")
+
 
 @app.route("/setup-2fa")
 @login_required
 def setup_2fa():
     return render_template("setup_2fa.html")
+
+@app.route("/admin/users/<int:user_id>/edit", methods=["GET", "POST"])
+@login_required
+def admin_user_edit(user_id):
+    super_admin_only()
+
+    edit_user = db.session.get(User, user_id)
+    if not edit_user:
+        flash("User not found.", "danger")
+        return redirect(url_for("admin_users"))
+
+    if request.method == "POST":
+        edit_user.email = (request.form.get("email") or "").strip().lower()
+        edit_user.is_super_admin = True if request.form.get("is_super_admin") else False
+        edit_user.is_admin = True if request.form.get("is_admin") else False
+        edit_user.is_active_user = True if request.form.get("is_active_user") else False
+        edit_user.must_change_password = True if request.form.get("must_change_password") else False
+
+        new_password = request.form.get("new_password") or ""
+
+        if new_password:
+            if not password_meets_policy(new_password):
+                flash("Password does not meet policy.", "warning")
+                return render_template("admin_user_edit.html", edit_user=edit_user)
+
+            edit_user.set_password(new_password)
+            edit_user.must_change_password = True
+
+        db.session.commit()
+
+        log_audit(
+            "update",
+            "user",
+            edit_user.id,
+            details=f"Updated user: {edit_user.email}",
+            user_id=current_user.id
+        )
+
+        flash("User updated.", "success")
+        return redirect(url_for("admin_users"))
+
+    return render_template("admin_user_edit.html", edit_user=edit_user)
+
+@app.route("/account", methods=["GET", "POST"])
+@login_required
+def account():
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "change_password":
+            current_pw = request.form.get("current_password") or ""
+            new_pw = request.form.get("new_password") or ""
+            confirm_pw = request.form.get("confirm_password") or ""
+
+            if not current_user.check_password(current_pw):
+                flash("Current password is incorrect.", "danger")
+                return redirect(url_for("account"))
+
+            if new_pw != confirm_pw:
+                flash("New passwords do not match.", "warning")
+                return redirect(url_for("account"))
+
+            if not password_meets_policy(new_pw):
+                flash("Password does not meet policy.", "warning")
+                return redirect(url_for("account"))
+
+            current_user.set_password(new_pw)
+            current_user.must_change_password = False
+            db.session.commit()
+
+            log_audit(
+                "change_password",
+                "user",
+                current_user.id,
+                details="User changed own password",
+                user_id=current_user.id
+            )
+
+            flash("Password changed.", "success")
+            return redirect(url_for("account"))
+
+    return render_template("account.html")
 #-----------------Onboarding------------
 
 
@@ -1020,16 +1150,35 @@ def pw_new():
         return redirect(url_for("pw_view", pw_id=p.id))
     return render_template("pw_edit.html", org=org, row=None)
 
+@app.route("/passwords/<int:pw_id>/otp")
+@login_required
+def pw_otp(pw_id):
+    org = require_active_org()
+    row = db.session.get(Password, pw_id)
+
+    if not org or not row or row.org_id != org.id:
+        return jsonify({"error": "not found"}), 404
+
+    code = generate_totp_code(row.otp_secret)
+
+    if not code:
+        return jsonify({"otp": "", "message": "No valid OTP configured"})
+
+    return jsonify({"otp": code})
+
+
 @app.route("/passwords/<int:pw_id>", methods=["GET", "POST"])
 @login_required
 def pw_edit(pw_id):
     org = require_active_org()
     if not org:
         return redirect(url_for("orgs"))
+
     row = db.session.get(Password, pw_id)
     if not row or row.org_id != org.id:
         flash("Password not found.", "danger")
         return redirect(url_for("pw_list"))
+
     if request.method == "POST":
         hist = PasswordHistory(
             password_id=row.id,
@@ -1043,22 +1192,45 @@ def pw_edit(pw_id):
             changed_by=current_user.id
         )
         db.session.add(hist)
+
+        otp_secret = (
+            (request.form.get("otp_secret") or "")
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("\n", "")
+            .strip()
+            .upper()
+        )
+
         row.name = (request.form.get("name") or "").strip()
         row.username_plain = encrypt_secret(request.form.get("username") or None)
         row.password_plain = encrypt_secret(request.form.get("password") or None)
+        row.otp_secret = encrypt_secret(otp_secret or None)
         row.url = request.form.get("url") or None
         row.notes = request.form.get("notes") or None
-        row.otp_secret = encrypt_secret((request.form.get("otp_secret") or "").strip() or None)
         row.updated_at = datetime.utcnow()
         row.updated_by = current_user.id
+
         if not row.name:
             flash("Name required.", "warning")
             return render_template("pw_edit.html", org=org, row=row)
+
         db.session.commit()
         log_audit("update", "password", row.id, org_id=org.id, details=f"Updated password: {row.name}")
         flash("Password updated.", "success")
         return redirect(url_for("pw_view", pw_id=row.id))
-    return render_template("pw_edit.html", org=org, row=row)
+
+    edit_row = {
+        "id": row.id,
+        "name": row.name,
+        "url": row.url,
+        "username_plain": decrypt_secret(row.username_plain),
+        "password_plain": decrypt_secret(row.password_plain),
+        "otp_secret": decrypt_secret(row.otp_secret),
+        "notes": row.notes,
+    }
+
+    return render_template("pw_edit.html", org=org, row=edit_row)
 
 @app.route("/passwords/<int:pw_id>/view")
 @login_required
@@ -1128,11 +1300,16 @@ def pw_rollback(pw_id, history_id):
 def pw_secret(pw_id):
     org = require_active_org()
     row = db.session.get(Password, pw_id)
+
     if not org or not row or row.org_id != org.id:
         return jsonify({"error": "not found"}), 404
-    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
-    return jsonify({"username": decrypt_secret(row.username_plain), "password": decrypt_secret(row.password_plain), "otp_secret": decrypt_secret(row.otp_secret)})
 
+    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
+    return jsonify({
+        "username": decrypt_secret(row.username_plain) or "",
+        "password": decrypt_secret(row.password_plain) or "",
+        "otp_secret": decrypt_secret(row.otp_secret) or ""
+    })
 # ---------------- Domains ----------------
 @app.route("/domains")
 @login_required
@@ -1992,6 +2169,25 @@ def admin_assets_config():
         return redirect(url_for("admin_assets_config"))
     return render_template("admin_assets_config.html", types=AssetType.query.order_by(AssetType.name.asc()).all(), brands=AssetBrand.query.order_by(AssetBrand.name.asc()).all())
 
+@app.route("/admin/users/<int:user_id>/toggle-active", methods=["POST"])
+@login_required
+def admin_user_toggle_active(user_id):
+    super_admin_only()
+
+    user = db.session.get(User, user_id)
+    if not user:
+        flash("User not found.", "danger")
+        return redirect(url_for("admin_users"))
+
+    if user.id == current_user.id:
+        flash("You cannot disable your own account.", "warning")
+        return redirect(url_for("admin_users"))
+
+    user.is_active_user = not user.is_active_user
+    db.session.commit()
+
+    flash("User updated.", "success")
+    return redirect(url_for("admin_users"))
 
 # ---------------- Dashboard / Audit / Asset Extensions ----------------
 @app.route("/dashboard/data")

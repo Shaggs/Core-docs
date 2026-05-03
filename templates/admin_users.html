@@ -1,1 +1,180 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">Admin – Users</h2><div class="d-flex justify-content-between mb-3"><div class="text-muted">Manage users and roles.</div><a href="{{ url_for('admin_users_new') }}" class="btn btn-primary">Add User</a></div><div class="card shadow-sm"><div class="table-responsive"><table class="table table-hover mb-0"><thead class="table-light"><tr><th>Email</th><th>Role</th><th>2FA</th><th>Last Login</th></tr></thead><tbody>{% for u in users %}<tr><td>{{ u.email }}</td><td>{% if u.is_super_admin %}<span class="badge text-bg-danger">Super Admin</span>{% elif u.is_admin %}<span class="badge text-bg-primary">Admin</span>{% else %}<span class="badge text-bg-secondary">User</span>{% endif %}</td><td>{{ "Enabled" if u.is_totp_enabled else "No" }}</td><td>{% if u.last_login_at %}{{ u.last_login_at.strftime("%Y-%m-%d %H:%M") }}{% else %}—{% endif %}</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}
+{% extends "base.html" %}
+
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">User Management</h2>
+    <div class="text-muted">
+      Manage users, permissions, MFA and access
+    </div>
+  </div>
+
+  <a href="{{ url_for('admin_users_new') }}"
+     class="btn btn-primary">
+    New User
+  </a>
+</div>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Status</th>
+            <th>Role</th>
+            <th>MFA</th>
+            <th>Last Login</th>
+            <th>Password Reset</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+
+        <tbody>
+
+          {% for u in users %}
+          <tr>
+
+            <!-- Email -->
+            <td>
+              <div class="fw-semibold">
+                {{ u.email }}
+              </div>
+
+              {% if u.id == current_user.id %}
+              <div class="small text-muted">
+                Your account
+              </div>
+              {% endif %}
+            </td>
+
+            <!-- Status -->
+            <td>
+              {% if u.is_active_user %}
+                <span class="badge bg-success">
+                  Enabled
+                </span>
+              {% else %}
+                <span class="badge bg-danger">
+                  Disabled
+                </span>
+              {% endif %}
+            </td>
+
+            <!-- Role -->
+            <td>
+
+              {% if u.is_super_admin %}
+                <span class="badge bg-dark">
+                  Super Admin
+                </span>
+
+              {% elif u.is_admin %}
+                <span class="badge bg-primary">
+                  Admin
+                </span>
+
+              {% else %}
+                <span class="badge bg-secondary">
+                  User
+                </span>
+              {% endif %}
+
+            </td>
+
+            <!-- MFA -->
+            <td>
+
+              {% if u.is_totp_enabled %}
+                <span class="badge bg-success">
+                  Enabled
+                </span>
+              {% else %}
+                <span class="badge bg-warning text-dark">
+                  Disabled
+                </span>
+              {% endif %}
+
+            </td>
+
+            <!-- Last Login -->
+            <td>
+              {% if u.last_login_at %}
+                {{ u.last_login_at.strftime("%Y-%m-%d %H:%M") }}
+              {% else %}
+                <span class="text-muted">
+                  Never
+                </span>
+              {% endif %}
+            </td>
+
+            <!-- Force Reset -->
+            <td>
+
+              {% if u.must_change_password %}
+                <span class="badge bg-warning text-dark">
+                  Required
+                </span>
+              {% else %}
+                <span class="badge bg-success">
+                  No
+                </span>
+              {% endif %}
+
+            </td>
+
+            <!-- Actions -->
+            <td class="text-end">
+
+              <div class="d-flex gap-2 justify-content-end flex-wrap">
+
+                <!-- Edit -->
+                <a href="{{ url_for('admin_user_edit', user_id=u.id) }}"
+                   class="btn btn-sm btn-outline-primary">
+                  Edit
+                </a>
+
+                <!-- Enable / Disable -->
+                {% if u.id != current_user.id %}
+                <form method="post"
+                      action="{{ url_for('admin_user_toggle_active', user_id=u.id) }}"
+                      class="d-inline">
+
+                  {% if u.is_active_user %}
+                    <button class="btn btn-sm btn-outline-warning">
+                      Disable
+                    </button>
+                  {% else %}
+                    <button class="btn btn-sm btn-outline-success">
+                      Enable
+                    </button>
+                  {% endif %}
+
+                </form>
+                {% endif %}
+
+                <!-- Delete -->
+                {% if u.id != current_user.id %}
+
+                {% endif %}
+
+              </div>
+
+            </td>
+
+          </tr>
+          {% endfor %}
+
+        </tbody>
+
+      </table>
+    </div>
+
+  </div>
+</div>
+
+{% endblock %}

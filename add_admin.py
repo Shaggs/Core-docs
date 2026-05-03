@@ -1,4 +1,4 @@
-rom app import app, db, User
+from app import app, db, User
 
 with app.app_context():
     u = User(email="admin@local")
