@@ -189,6 +189,7 @@
 
       {% if active_org %}
       <div class="sidebar-section-title">Org: {{ active_org.name }}</div>
+      <a href="{{ url_for('onboarding_view') }}">Onboarding</a>
       <a href="{{ url_for('org_view', org_id=active_org.id) }}">Overview</a>
       <a href="{{ url_for('pw_list') }}">Passwords</a>
       <a href="{{ url_for('docs') }}">Documentation</a>

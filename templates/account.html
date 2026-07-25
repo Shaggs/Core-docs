@@ -1,15 +1,71 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">My Account</h2><div class="card shadow-sm p-3" style="max-width:720px;"><p><strong>Email:</strong> {{ current_user.email }}</p><p class="text-muted mb-0">Account management can be extended here.</p></div>
-<div class="card shadow-sm mt-3">
-  <div class="card-body">
-    <h5 class="card-title">Multi-Factor Authentication</h5>
-    {% if current_user.is_totp_enabled %}
-      <p class="text-success mb-3">MFA is currently enabled on your account.</p>
-      <form method="post" action="{{ url_for('disable_2fa') }}" onsubmit="return confirm('Disable MFA for your account?');">
-        <button class="btn btn-outline-danger">Disable MFA</button>
-      </form>
-    {% else %}
-      <p class="text-muted mb-3">Protect your account with an authenticator app.</p>
-      <a href="{{ url_for('setup_2fa') }}" class="btn btn-primary">Set Up MFA</a>
-    {% endif %}
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">My Account</h2>
+    <div class="text-muted">{{ current_user.email }}</div>
   </div>
-</div>{% endblock %}
+</div>
+
+<div class="row g-3">
+
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Change Password</h5>
+
+        <form method="post">
+          <input type="hidden" name="action" value="change_password">
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Current Password</label>
+            <input type="password" name="current_password" class="form-control" required>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">New Password</label>
+            <input type="password" name="new_password" class="form-control" required>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Confirm New Password</label>
+            <input type="password" name="confirm_password" class="form-control" required>
+          </div>
+
+          <button type="submit" class="btn btn-primary">
+            Update Password
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Multi-Factor Authentication</h5>
+
+        {% if current_user.is_totp_enabled %}
+          <p class="text-success">MFA is enabled on your account.</p>
+
+          <form method="post"
+                action="{{ url_for('disable_2fa') }}"
+                onsubmit="return confirm('Disable MFA for your account?');">
+            <button class="btn btn-outline-danger">
+              Disable MFA
+            </button>
+          </form>
+        {% else %}
+          <p class="text-muted">Protect your account with an authenticator app.</p>
+
+          <a href="{{ url_for('setup_2fa') }}" class="btn btn-primary">
+            Set Up MFA
+          </a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

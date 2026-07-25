@@ -9,6 +9,13 @@ import io
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 from pathlib import Path
+import io
+import pyotp
+import qrcode
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
@@ -59,6 +66,44 @@ ALLOWED_EXTS = {"pdf","doc","docx","xls","xlsx","ppt","pptx","txt","jpg","jpeg",
 
 # ---------------- Models ----------------
 
+class OnboardingRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False, unique=True, index=True)
+
+    welcome_package_given = db.Column(db.Boolean, default=False)
+    welcome_package_given_by = db.Column(db.String(200))
+    welcome_package_given_on = db.Column(db.Date)
+
+    site_contact_established = db.Column(db.Boolean, default=False)
+    site_contact_established_by = db.Column(db.String(200))
+    site_contact_established_on = db.Column(db.Date)
+
+    rmm_installed = db.Column(db.Boolean, default=False)
+    rmm_installed_by = db.Column(db.String(200))
+    rmm_installed_on = db.Column(db.Date)
+
+    m365_or_google_admin_created = db.Column(db.Boolean, default=False)
+    m365_or_google_admin_created_by = db.Column(db.String(200))
+    m365_or_google_admin_created_on = db.Column(db.Date)
+
+    domain_taken_over = db.Column(db.Boolean, default=False)
+    domain_taken_over_by = db.Column(db.String(200))
+    domain_taken_over_on = db.Column(db.Date)
+
+    network_scoped = db.Column(db.Boolean, default=False)
+    network_scoped_by = db.Column(db.String(200))
+    network_scoped_on = db.Column(db.Date)
+
+    passwords_uploaded = db.Column(db.Boolean, default=False)
+    passwords_uploaded_by = db.Column(db.String(200))
+    passwords_uploaded_on = db.Column(db.Date)
+
+    backups_set = db.Column(db.Boolean, default=False)
+    backups_set_by = db.Column(db.String(200))
+    backups_set_on = db.Column(db.Date)
+
+    notes = db.Column(db.Text)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 class DocPage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False)
@@ -73,6 +118,7 @@ class DocPage(db.Model):
     folder = db.relationship("DocFolder", backref="pages")
     created_by_user = db.relationship("User", foreign_keys=[created_by])
     updated_by_user = db.relationship("User", foreign_keys=[updated_by])
+
 class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(320), unique=True, nullable=False, index=True)
@@ -80,11 +126,14 @@ class User(db.Model, UserMixin):
     is_admin = db.Column(db.Boolean, default=False)
     is_super_admin = db.Column(db.Boolean, default=False, nullable=False)
     is_totp_enabled = db.Column(db.Boolean, default=False)
+    is_active_user = db.Column(db.Boolean, default=True, nullable=False)
     totp_secret = db.Column(db.String(64), nullable=True)
     failed_logins = db.Column(db.Integer, default=0)
     locked_until = db.Column(db.DateTime, nullable=True)
     must_change_password = db.Column(db.Boolean, default=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
+
+
 
     def set_password(self, raw):
         self.password_hash = generate_password_hash(raw)
@@ -263,6 +312,50 @@ def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 # ---------------- Helpers ----------------
+def build_totp_uri(user_email, secret):
+    return pyotp.TOTP(secret).provisioning_uri(
+        name=user_email,
+        issuer_name="CoreSight Vault"
+    )
+
+
+def verify_totp_code(secret, code):
+    if not secret or not code:
+        return False
+    return pyotp.TOTP(secret).verify(str(code).strip(), valid_window=1)
+
+
+def make_qr_data_uri(text):
+    img = qrcode.make(text)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+def generate_totp_code(secret):
+    if not secret:
+        return None
+
+    try:
+        import pyotp
+
+        clean_secret = (
+            decrypt_secret(secret)
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("\n", "")
+            .strip()
+            .upper()
+        )
+
+        if not clean_secret:
+            return None
+
+        return pyotp.TOTP(clean_secret).now()
+
+    except Exception as e:
+        print("TOTP ERROR:", e)
+        return None
 
 def _snippet(text, q, radius=80):
     if not text:
@@ -355,8 +448,20 @@ def get_dashboard_data(org_id):
     password_count = Password.query.filter_by(org_id=org_id).count()
     contact_count = SiteContact.query.filter_by(org_id=org_id).count()
     asset_count = Asset.query.filter_by(org_id=org_id).count()
+    onboarding = OnboardingRecord.query.filter_by(org_id=org_id).first()
+    onboarding_done = 0
+    onboarding_total = len(ONBOARDING_FIELDS)
+    onboarding_percent = 0
+
+    if onboarding:
+        onboarding_done, onboarding_total, onboarding_percent = onboarding_progress(onboarding)
 
     return {
+            "onboarding": {
+            "done": onboarding_done,
+            "total": onboarding_total,
+            "percent": onboarding_percent,
+        },
         "counts": {
             "passwords": password_count,
             "documents": docs_count,
@@ -603,6 +708,158 @@ def enforce_password_change():
         if request.endpoint not in allowed_endpoints:
             return redirect(url_for("change_password"))
 
+ONBOARDING_FIELDS = [
+    ("welcome_package_given", "Welcome package given"),
+    ("site_contact_established", "Site contact established"),
+    ("rmm_installed", "RMM installed"),
+    ("m365_or_google_admin_created", "M365/Google admin created"),
+    ("domain_taken_over", "Domain taken over"),
+    ("network_scoped", "Network scoped"),
+    ("passwords_uploaded", "Passwords uploaded"),
+    ("backups_set", "Backups set"),
+]
+
+def get_or_create_onboarding(org_id):
+    row = OnboardingRecord.query.filter_by(org_id=org_id).first()
+    if not row:
+        row = OnboardingRecord(org_id=org_id)
+        db.session.add(row)
+        db.session.commit()
+    return row
+
+def onboarding_progress(row):
+    total = len(ONBOARDING_FIELDS)
+    done = sum(1 for field, _label in ONBOARDING_FIELDS if getattr(row, field, False))
+    percent = int(round((done / total) * 100)) if total else 0
+    return done, total, percent
+
+@app.route("/onboarding", methods=["GET", "POST"])
+@login_required
+def onboarding_view():
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    row = get_or_create_onboarding(org.id)
+
+    if request.method == "POST":
+        row.actioned_by = (request.form.get("actioned_by") or "").strip() or None
+
+        actioned_on = (request.form.get("actioned_on") or "").strip()
+        row.actioned_on = None
+        if actioned_on:
+            try:
+                row.actioned_on = datetime.strptime(actioned_on, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Actioned date must be YYYY-MM-DD.", "warning")
+                return render_template(
+                    "onboarding.html",
+                    org=org,
+                    row=row,
+                    onboarding_fields=ONBOARDING_FIELDS,
+                    progress=onboarding_progress(row)
+                )
+
+        for field, _label in ONBOARDING_FIELDS:
+            is_checked = request.form.get(field) == "on"
+            setattr(row, field, is_checked)
+
+            # Per item metadata
+            by_value = request.form.get(f"{field}_by")
+            on_value = request.form.get(f"{field}_on")
+
+            setattr(row, f"{field}_by", by_value or None)
+
+            if on_value:
+                try:
+                    setattr(row, f"{field}_on", datetime.strptime(on_value, "%Y-%m-%d").date())
+                except ValueError:
+                    setattr(row, f"{field}_on", None)
+            else:
+                setattr(row, f"{field}_on", None)
+        row.notes = (request.form.get("notes") or "").strip() or None
+        row.updated_at = datetime.utcnow()
+
+        db.session.commit()
+        flash("Onboarding checklist saved.", "success")
+        return redirect(url_for("onboarding_view"))
+
+    return render_template(
+        "onboarding.html",
+        org=org,
+        row=row,
+        onboarding_fields=ONBOARDING_FIELDS,
+        progress=onboarding_progress(row)
+    )
+
+
+@app.route("/onboarding/pdf")
+@login_required
+def onboarding_export_pdf():
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+
+    row = get_or_create_onboarding(org.id)
+    done, total, percent = onboarding_progress(row)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=30,
+        bottomMargin=30
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph(f"Onboarding Checklist - {org.name}", styles["Title"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"<b>Progress:</b> {done} / {total} ({percent}%)", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    data = [["Item", "Status", "Actioned By", "Actioned On"]]
+    for field, label in ONBOARDING_FIELDS:
+        is_complete = getattr(row, field, False)
+        by_value = getattr(row, f"{field}_by", None) or "-"
+        on_value = getattr(row, f"{field}_on", None)
+        on_text = on_value.strftime("%d-%m-%Y") if on_value else "-"
+
+        data.append([
+            label,
+            "Complete" if is_complete else "Pending",
+            by_value,
+            on_text
+        ])
+
+    table = Table(data, colWidths=[240, 80, 110, 90])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightyellow]),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 16))
+
+    story.append(Paragraph("<b>Notes</b>", styles["Heading3"]))
+    story.append(Paragraph((row.notes or "No notes added.").replace("\n", "<br/>"), styles["Normal"]))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    safe_name = "".join(c for c in org.name if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_")
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"{safe_name}_onboarding_checklist.pdf",
+        mimetype="application/pdf"
+    )
+
 # ---------------- Auth ----------------
 LOCKOUT_THRESHOLD = 5
 LOCKOUT_MINUTES = 15
@@ -627,6 +884,11 @@ def login():
         if not user:
             flash("Invalid credentials.", "danger")
             return render_template("login.html")
+        
+        if not getattr(user, "is_active_user", True):
+            flash("This account has been disabled.", "danger")
+            return render_template("login.html")
+        
         if is_locked(user) and not user.is_super_admin:
             flash("Account is temporarily locked.", "danger")
             return render_template("login.html")
@@ -641,6 +903,10 @@ def login():
         user.locked_until = None
         user.last_login_at = datetime.utcnow()
         db.session.commit()
+        if user.is_totp_enabled and user.totp_secret:
+            session["preauth_user_id"] = user.id
+            flash("Enter your MFA code to continue.", "info")
+            return redirect(url_for("login_mfa"))
         login_user(user)
         log_audit("login", "user", user.id, details="Successful login", user_id=user.id)
 
@@ -704,15 +970,145 @@ def reset_password(token):
         return redirect(url_for("login"))
     return render_template("reset_password.html")
 
-@app.route("/account")
+@app.route("/change-password", methods=["GET", "POST"])
 @login_required
-def account():
-    return render_template("account.html")
+def change_password():
+    if request.method == "POST":
+        new_password = request.form.get("password")
+        confirm_password = request.form.get("confirm_password")
+
+        if not new_password or new_password != confirm_password:
+            flash("Passwords do not match.", "danger")
+            return render_template("change_password.html")
+
+        current_user.set_password(new_password)
+        current_user.must_change_password = False
+        db.session.commit()
+
+        flash("Password changed successfully.", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("change_password.html")
+
 
 @app.route("/setup-2fa")
 @login_required
 def setup_2fa():
     return render_template("setup_2fa.html")
+
+@app.route("/admin/users/<int:user_id>/edit", methods=["GET", "POST"])
+@login_required
+def admin_user_edit(user_id):
+    super_admin_only()
+
+    edit_user = db.session.get(User, user_id)
+    if not edit_user:
+        flash("User not found.", "danger")
+        return redirect(url_for("admin_users"))
+
+    if request.method == "POST":
+        edit_user.email = (request.form.get("email") or "").strip().lower()
+        edit_user.is_super_admin = True if request.form.get("is_super_admin") else False
+        edit_user.is_admin = True if request.form.get("is_admin") else False
+        edit_user.is_active_user = True if request.form.get("is_active_user") else False
+        edit_user.must_change_password = True if request.form.get("must_change_password") else False
+
+        new_password = request.form.get("new_password") or ""
+
+        if new_password:
+            if not password_meets_policy(new_password):
+                flash("Password does not meet policy.", "warning")
+                return render_template("admin_user_edit.html", edit_user=edit_user)
+
+            edit_user.set_password(new_password)
+            edit_user.must_change_password = True
+
+        db.session.commit()
+
+        log_audit(
+            "update",
+            "user",
+            edit_user.id,
+            details=f"Updated user: {edit_user.email}",
+            user_id=current_user.id
+        )
+
+        flash("User updated.", "success")
+        return redirect(url_for("admin_users"))
+
+    return render_template("admin_user_edit.html", edit_user=edit_user)
+
+@app.route("/login/mfa", methods=["GET", "POST"])
+def login_mfa():
+    user_id = session.get("preauth_user_id")
+
+    if not user_id:
+        flash("Login expired. Please sign in again.", "warning")
+        return redirect(url_for("login"))
+
+    user = db.session.get(User, user_id)
+
+    if not user:
+        session.pop("preauth_user_id", None)
+        flash("User not found.", "danger")
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        code = request.form.get("code") or ""
+
+        if not verify_totp_code(user.totp_secret, code):
+            flash("Invalid MFA code.", "danger")
+            return render_template("login_mfa.html", email=user.email)
+
+        session.pop("preauth_user_id", None)
+
+        login_user(user)
+        flash("Login successful.", "success")
+        return redirect(url_for("orgs"))
+
+    return render_template("login_mfa.html", email=user.email)
+
+@app.route("/account", methods=["GET", "POST"])
+@login_required
+def account():
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "change_password":
+            current_pw = request.form.get("current_password") or ""
+            new_pw = request.form.get("new_password") or ""
+            confirm_pw = request.form.get("confirm_password") or ""
+
+            if not current_user.check_password(current_pw):
+                flash("Current password is incorrect.", "danger")
+                return redirect(url_for("account"))
+
+            if new_pw != confirm_pw:
+                flash("New passwords do not match.", "warning")
+                return redirect(url_for("account"))
+
+            if not password_meets_policy(new_pw):
+                flash("Password does not meet policy.", "warning")
+                return redirect(url_for("account"))
+
+            current_user.set_password(new_pw)
+            current_user.must_change_password = False
+            db.session.commit()
+
+            log_audit(
+                "change_password",
+                "user",
+                current_user.id,
+                details="User changed own password",
+                user_id=current_user.id
+            )
+
+            flash("Password changed.", "success")
+            return redirect(url_for("account"))
+
+    return render_template("account.html")
+#-----------------Onboarding------------
+
 
 # ---------------- Orgs ----------------
 @app.route("/home/reset")
@@ -761,6 +1157,29 @@ def org_view(org_id):
 
     dashboard_data = get_dashboard_data(org.id)
     return render_template("org_view.html", org=org, dashboard_data=dashboard_data)
+
+
+@app.route("/orgs/<int:org_id>/edit", methods=["GET", "POST"])
+@login_required
+def org_edit(org_id):
+    super_admin_only()
+    org = db.session.get(Organization, org_id)
+    if not org:
+        abort(404)
+
+    if request.method == "POST":
+        org.name = (request.form.get("name") or "").strip()
+        org.description = (request.form.get("description") or "").strip() or None
+
+        if not org.name:
+            flash("Name is required.", "warning")
+            return render_template("org_edit.html", org=org)
+
+        db.session.commit()
+        flash("Organisation saved.", "success")
+        return redirect(url_for("org_view", org_id=org.id))
+
+    return render_template("org_edit.html", org=org)
 
 # ---------------- Passwords ----------------
 @app.route("/passwords")
@@ -887,6 +1306,22 @@ def pw_import():
     )
     flash(f"Imported {len(imported)} password records.", "success")
     return redirect(url_for("pw_list"))
+@app.route("/passwords/<int:pw_id>/otp")
+@login_required
+def pw_otp(pw_id):
+    org = require_active_org()
+    row = db.session.get(Password, pw_id)
+
+    if not org or not row or row.org_id != org.id:
+        return jsonify({"error": "not found"}), 404
+
+    code = generate_totp_code(row.otp_secret)
+
+    if not code:
+        return jsonify({"otp": "", "message": "No valid OTP configured"})
+
+    return jsonify({"otp": code})
+
 
 @app.route("/passwords/<int:pw_id>", methods=["GET", "POST"])
 @login_required
@@ -894,10 +1329,12 @@ def pw_edit(pw_id):
     org = require_active_org()
     if not org:
         return redirect(url_for("orgs"))
+
     row = db.session.get(Password, pw_id)
     if not row or row.org_id != org.id:
         flash("Password not found.", "danger")
         return redirect(url_for("pw_list"))
+
     if request.method == "POST":
         hist = PasswordHistory(
             password_id=row.id,
@@ -911,22 +1348,45 @@ def pw_edit(pw_id):
             changed_by=current_user.id
         )
         db.session.add(hist)
+
+        otp_secret = (
+            (request.form.get("otp_secret") or "")
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("\n", "")
+            .strip()
+            .upper()
+        )
+
         row.name = (request.form.get("name") or "").strip()
         row.username_plain = encrypt_secret(request.form.get("username") or None)
         row.password_plain = encrypt_secret(request.form.get("password") or None)
+        row.otp_secret = encrypt_secret(otp_secret or None)
         row.url = request.form.get("url") or None
         row.notes = request.form.get("notes") or None
-        row.otp_secret = encrypt_secret((request.form.get("otp_secret") or "").strip() or None)
         row.updated_at = datetime.utcnow()
         row.updated_by = current_user.id
+
         if not row.name:
             flash("Name required.", "warning")
             return render_template("pw_edit.html", org=org, row=row)
+
         db.session.commit()
         log_audit("update", "password", row.id, org_id=org.id, details=f"Updated password: {row.name}")
         flash("Password updated.", "success")
         return redirect(url_for("pw_view", pw_id=row.id))
-    return render_template("pw_edit.html", org=org, row=row)
+
+    edit_row = {
+        "id": row.id,
+        "name": row.name,
+        "url": row.url,
+        "username_plain": decrypt_secret(row.username_plain),
+        "password_plain": decrypt_secret(row.password_plain),
+        "otp_secret": decrypt_secret(row.otp_secret),
+        "notes": row.notes,
+    }
+
+    return render_template("pw_edit.html", org=org, row=edit_row)
 
 @app.route("/passwords/<int:pw_id>/view")
 @login_required
@@ -996,10 +1456,9 @@ def pw_rollback(pw_id, history_id):
 def pw_secret(pw_id):
     org = require_active_org()
     row = db.session.get(Password, pw_id)
+
     if not org or not row or row.org_id != org.id:
         return jsonify({"error": "not found"}), 404
-    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
-    return jsonify({"username": decrypt_secret(row.username_plain), "password": decrypt_secret(row.password_plain), "otp_secret": decrypt_secret(row.otp_secret)})
 
 @app.route("/passwords/<int:pw_id>/share", methods=["POST"])
 @login_required
@@ -1070,6 +1529,12 @@ def pw_share_open(token):
         password=decrypt_secret(row.password_plain),
     )
 
+    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
+    return jsonify({
+        "username": decrypt_secret(row.username_plain) or "",
+        "password": decrypt_secret(row.password_plain) or "",
+        "otp_secret": decrypt_secret(row.otp_secret) or ""
+    })
 # ---------------- Domains ----------------
 @app.route("/domains")
 @login_required
@@ -1451,6 +1916,39 @@ def docs_folder_delete(folder_id):
     flash("Folder deleted.", "success")
     return redirect(url_for("docs", folder=parent_id))
 
+@app.route("/org/<int:org_id>/docs/folder/new", methods=["GET", "POST"])
+@login_required
+def docs_folder_new(org_id):
+    org = db.session.get(Organization, org_id)
+    if not org:
+        abort(404)
+
+    if request.method == "POST":
+        folder_name = (request.form.get("folder_name") or "").strip()
+        parent_id = request.form.get("parent_id", type=int)
+
+        if not folder_name:
+            flash("Folder name is required.", "danger")
+            return redirect(url_for("docs_folder_new", org_id=org_id))
+
+        parent = db.session.get(DocFolder, parent_id) if parent_id else None
+        if parent and parent.org_id != org_id:
+            flash("Parent folder not found.", "danger")
+            return redirect(url_for("docs", folder=parent_id))
+
+        folder = DocFolder(
+            org_id=org_id,
+            name=folder_name,
+            parent_id=parent_id
+        )
+        db.session.add(folder)
+        db.session.commit()
+
+        flash("Folder created successfully.", "success")
+        return redirect(url_for("docs", folder=parent_id))
+
+    parent_id = request.args.get("parent_id", type=int)
+    return render_template("docs_folder_new.html", org=org, org_id=org_id, parent_id=parent_id)
 # ---------------- Contacts ----------------
 @app.route("/contacts")
 @login_required
@@ -1896,6 +2394,25 @@ def admin_assets_config():
         return redirect(url_for("admin_assets_config"))
     return render_template("admin_assets_config.html", types=AssetType.query.order_by(AssetType.name.asc()).all(), brands=AssetBrand.query.order_by(AssetBrand.name.asc()).all())
 
+@app.route("/admin/users/<int:user_id>/toggle-active", methods=["POST"])
+@login_required
+def admin_user_toggle_active(user_id):
+    super_admin_only()
+
+    user = db.session.get(User, user_id)
+    if not user:
+        flash("User not found.", "danger")
+        return redirect(url_for("admin_users"))
+
+    if user.id == current_user.id:
+        flash("You cannot disable your own account.", "warning")
+        return redirect(url_for("admin_users"))
+
+    user.is_active_user = not user.is_active_user
+    db.session.commit()
+
+    flash("User updated.", "success")
+    return redirect(url_for("admin_users"))
 
 # ---------------- Dashboard / Audit / Asset Extensions ----------------
 @app.route("/dashboard/data")
