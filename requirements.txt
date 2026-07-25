@@ -18,6 +18,9 @@ pyotp==2.9.0
 qrcode==7.4.2
 Pillow==10.3.0
 
+# PDF report generation
+reportlab>=4.2,<5
+
 # HTTP requests (DNS lookups / future APIs)
 requests==2.32.3
 

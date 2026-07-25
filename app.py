@@ -1,8 +1,11 @@
 
 import os
+import secrets
 import smtplib
 import base64
+import csv
 import hashlib
+import io
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
 from pathlib import Path
@@ -170,6 +173,17 @@ class PasswordHistory(db.Model):
     changed_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
     changed_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     changed_by_user = db.relationship("User", foreign_keys=[changed_by])
+
+class PasswordShareLink(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    password_id = db.Column(db.Integer, db.ForeignKey("password.id"), nullable=False)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    recipient_email = db.Column(db.String(320), nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
 
 class Domain(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -1205,6 +1219,93 @@ def pw_new():
         return redirect(url_for("pw_view", pw_id=p.id))
     return render_template("pw_edit.html", org=org, row=None)
 
+@app.route("/passwords/import", methods=["GET", "POST"])
+@login_required
+def pw_import():
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+    if request.method == "GET":
+        return render_template("pw_import.html", org=org)
+
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        flash("Choose a CSV file to import.", "warning")
+        return render_template("pw_import.html", org=org)
+    if not upload.filename.lower().endswith(".csv"):
+        flash("The import file must have a .csv extension.", "warning")
+        return render_template("pw_import.html", org=org)
+
+    try:
+        text = upload.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        flash("The CSV file must use UTF-8 encoding.", "warning")
+        return render_template("pw_import.html", org=org)
+
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("The CSV file does not contain a header row.")
+        headers = {(header or "").strip().lower(): header for header in reader.fieldnames}
+        if "name" not in headers:
+            raise ValueError("The CSV header must include a name column.")
+
+        imported = []
+        errors = []
+        for line_number, source_row in enumerate(reader, start=2):
+            if line_number > 10001:
+                raise ValueError("A maximum of 10,000 password records can be imported at once.")
+            if None in source_row:
+                errors.append(f"Row {line_number}: contains more values than the header row.")
+                continue
+            row = {
+                (key or "").strip().lower(): (value or "").strip()
+                for key, value in source_row.items()
+                if key is not None
+            }
+            if not any(row.values()):
+                continue
+            name = row.get("name", "")
+            if not name:
+                errors.append(f"Row {line_number}: name is required.")
+                continue
+            if len(name) > 200:
+                errors.append(f"Row {line_number}: name cannot exceed 200 characters.")
+                continue
+            imported.append(Password(
+                org_id=org.id,
+                name=name,
+                username_plain=encrypt_secret(row.get("username") or None),
+                password_plain=encrypt_secret(row.get("password") or None),
+                url=(row.get("url") or None),
+                notes=(row.get("notes") or None),
+                otp_secret=encrypt_secret(row.get("otp_secret") or None),
+                updated_at=datetime.utcnow(),
+                updated_by=current_user.id,
+            ))
+    except (csv.Error, ValueError) as exc:
+        flash(f"Unable to import CSV: {exc}", "danger")
+        return render_template("pw_import.html", org=org)
+
+    if errors:
+        flash("No passwords were imported. " + " ".join(errors[:10]), "danger")
+        if len(errors) > 10:
+            flash(f"Plus {len(errors) - 10} additional row errors.", "danger")
+        return render_template("pw_import.html", org=org)
+    if not imported:
+        flash("The CSV file did not contain any password records.", "warning")
+        return render_template("pw_import.html", org=org)
+
+    db.session.add_all(imported)
+    db.session.commit()
+    log_audit(
+        "import",
+        "password",
+        org_id=org.id,
+        details=f"Imported {len(imported)} password records from CSV",
+    )
+    flash(f"Imported {len(imported)} password records.", "success")
+    return redirect(url_for("pw_list"))
 @app.route("/passwords/<int:pw_id>/otp")
 @login_required
 def pw_otp(pw_id):
@@ -1358,6 +1459,75 @@ def pw_secret(pw_id):
 
     if not org or not row or row.org_id != org.id:
         return jsonify({"error": "not found"}), 404
+
+@app.route("/passwords/<int:pw_id>/share", methods=["POST"])
+@login_required
+def pw_share(pw_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+    row = db.session.get(Password, pw_id)
+    if not row or row.org_id != org.id:
+        flash("Password not found.", "danger")
+        return redirect(url_for("pw_list"))
+
+    recipient_email = (request.form.get("recipient_email") or "").strip() or None
+    try:
+        expires_minutes = int((request.form.get("expires_minutes") or "60").strip())
+    except ValueError:
+        expires_minutes = 60
+    expires_minutes = max(1, min(expires_minutes, 10080))
+
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
+    share = PasswordShareLink(
+        password_id=row.id,
+        org_id=org.id,
+        token_hash=token_hash,
+        recipient_email=recipient_email,
+        expires_at=expires_at,
+        created_by=current_user.id,
+    )
+    db.session.add(share)
+    db.session.commit()
+
+    share_url = url_for("pw_share_open", token=token, _external=True)
+    if recipient_email:
+        try:
+            send_email(
+                recipient_email,
+                f"One-time password share: {row.name}",
+                f"Open this one-time link before it expires:\n\n{share_url}\n\nThis link expires at {expires_at.strftime('%Y-%m-%d %H:%M UTC')} and works one time only.",
+            )
+            flash("One-time share link emailed.", "success")
+        except Exception as e:
+            flash(f"Share link generated, but email failed: {e}", "warning")
+    else:
+        flash("One-time share link generated.", "success")
+    return redirect(url_for("pw_view", pw_id=row.id, share_link=share_url))
+
+@app.route("/shared/password/<token>")
+def pw_share_open(token):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    share = PasswordShareLink.query.filter_by(token_hash=token_hash).first()
+    now = datetime.utcnow()
+    if not share or share.used_at is not None or now > share.expires_at:
+        return render_template("shared_password_view.html", expired=True, row=None, username=None, password=None)
+
+    row = db.session.get(Password, share.password_id)
+    if not row or row.org_id != share.org_id:
+        return render_template("shared_password_view.html", expired=True, row=None, username=None, password=None)
+
+    share.used_at = now
+    db.session.commit()
+    return render_template(
+        "shared_password_view.html",
+        expired=False,
+        row=row,
+        username=decrypt_secret(row.username_plain),
+        password=decrypt_secret(row.password_plain),
+    )
 
     log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
     return jsonify({

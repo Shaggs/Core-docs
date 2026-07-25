@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block content %}
+<h2 class="mb-3">Import Passwords – {{ org.name }}</h2>
+
+<div class="card shadow-sm p-3">
+  <p>Upload a UTF-8 CSV file with a header row. The <code>name</code> column is required.</p>
+  <p class="text-muted">Supported columns: <code>name</code>, <code>username</code>, <code>password</code>, <code>url</code>, <code>notes</code>, and <code>otp_secret</code>. Empty rows are ignored. Imports are limited to 10,000 records.</p>
+
+  <form method="post" enctype="multipart/form-data">
+    <div class="mb-3">
+      <label for="csvFile" class="form-label">CSV File</label>
+      <input id="csvFile" type="file" name="file" class="form-control" accept=".csv,text/csv" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Import Passwords</button>
+    <a href="{{ url_for('pw_list') }}" class="btn btn-secondary">Cancel</a>
+  </form>
+</div>
+{% endblock %}
