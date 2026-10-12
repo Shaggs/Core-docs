@@ -1,9 +1,36 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-bs-theme="light">
 <head>
   <meta charset="utf-8">
   <title>Core Vault</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <script>
+    /* Theme: auto (follow the OS) / light / dark, remembered per browser. Runs before paint to avoid a flash. */
+    (function () {
+      var pref = 'auto';
+      try { pref = localStorage.getItem('theme') || 'auto'; } catch (e) {}
+      var dark = pref === 'dark' || (pref === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
+    })();
+    /* Send the CSRF token with every non-GET fetch() */
+    (function () {
+      var m = document.querySelector('meta[name=csrf-token]');
+      var tok = m ? m.content : '';
+      var orig = window.fetch;
+      window.fetch = function (u, o) {
+        o = o || {};
+        var meth = (o.method || 'GET').toUpperCase();
+        if (meth !== 'GET' && meth !== 'HEAD') {
+          var h = new Headers(o.headers || {});
+          h.set('X-CSRFToken', tok);
+          h.set('X-Requested-With', 'fetch');
+          o.headers = h;
+        }
+        return orig(u, o);
+      };
+    })();
+  </script>
 
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
@@ -19,8 +46,41 @@
     body {
       margin: 0;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: #f5f5f7;
     }
+    [data-bs-theme="light"] body { background: #f5f5f7; }
+    [data-bs-theme="dark"] body { background: #0e131c; }
+
+    /* Dark-theme fixes for Bootstrap classes that are hard-coded light */
+    [data-bs-theme="dark"] .bg-light,
+    [data-bs-theme="dark"] .bg-white:not(img) { background-color: var(--bs-tertiary-bg) !important; color: var(--bs-body-color) !important; }
+    [data-bs-theme="dark"] .table-light { --bs-table-bg: #2b3035; --bs-table-color: #dee2e6; --bs-table-border-color: #373b3e; }
+    [data-bs-theme="dark"] .btn-light { --bs-btn-bg: #2b3035; --bs-btn-color: #dee2e6; --bs-btn-border-color: #495057; }
+    [data-bs-theme="dark"] .card { border-color: #2a3140; }
+    [data-bs-theme="dark"] a:not(.btn):not(.list-group-item) { color: #6ea8fe; }
+    [data-bs-theme="dark"] .sidebar a { color: var(--sb-text); }
+    [data-bs-theme="dark"] .sidebar { border-right: 1px solid #1f2937; }
+    /* Quill rich-text editor */
+    [data-bs-theme="dark"] .ql-toolbar.ql-snow, [data-bs-theme="dark"] .ql-container.ql-snow { border-color: #373b3e; }
+    [data-bs-theme="dark"] .ql-toolbar.ql-snow { background: #2b3035; }
+    [data-bs-theme="dark"] .ql-editor { color: var(--bs-body-color); background: var(--bs-body-bg); }
+    [data-bs-theme="dark"] .ql-snow .ql-stroke { stroke: #ced4da; }
+    [data-bs-theme="dark"] .ql-snow .ql-fill { fill: #ced4da; }
+    [data-bs-theme="dark"] .ql-snow .ql-picker { color: #ced4da; }
+    [data-bs-theme="dark"] .ql-snow .ql-picker-options { background: #2b3035; }
+    [data-bs-theme="dark"] .ql-editor.ql-blank::before { color: #8a94a6; }
+    [data-bs-theme="dark"] .ql-snow .ql-editor pre.ql-syntax, [data-bs-theme="dark"] .ql-snow .ql-editor pre { background: #0b0f16; border: 1px solid #373b3e; color: #e6edf3; }
+    [data-bs-theme="dark"] .ql-snow .ql-editor blockquote { border-left-color: #6c757d; }
+    /* Password tags + list */
+    .tag-chip { background: var(--bs-tertiary-bg); color: var(--bs-body-color) !important; border: 1px solid var(--bs-border-color); font-weight: 500; }
+    .tag-chip:hover { border-color: var(--bs-primary); }
+    .pw-table { table-layout: fixed; min-width: 760px; }
+    .pw-table td { overflow-wrap: anywhere; }
+    /* Saved rich-text documents */
+    .doc-page-content pre { background: var(--bs-tertiary-bg); border: 1px solid var(--bs-border-color); border-radius: 6px; padding: .6rem .8rem; white-space: pre-wrap; }
+    .doc-page-content blockquote { border-left: 4px solid var(--bs-border-color); padding-left: .8rem; color: var(--bs-secondary-color); }
+    .doc-page-content img { max-width: 100%; height: auto; }
+    .theme-toggle { background: none; border: 1px solid #374151; color: var(--sb-muted); border-radius: 6px; font-size: .8rem; padding: .15rem .6rem; }
+    .theme-toggle:hover { color: var(--sb-text); border-color: #6b7280; }
 
     .layout-wrapper {
       display: flex;
@@ -73,10 +133,9 @@
     }
 
     .sidebar-footer {
-      position: absolute;
+      position: sticky;          /* stays visible but no longer covers the menu when it scrolls */
       bottom: 0;
-      left: 0;
-      right: 0;
+      background: var(--sb-bg);
       font-size: .8rem;
       padding: .6rem 1rem;
       border-top: 1px solid var(--sb-border);
@@ -89,6 +148,7 @@
       flex: 1;
       padding: 1.25rem;
       margin-left: 240px;
+      min-width: 0;   /* lets wide tables scroll inside their box instead of widening the page */
     }
 
     /* Remove sidebar spacing for auth pages */
@@ -186,6 +246,7 @@
       <div class="sidebar-section-title">Navigation</div>
       <a href="{{ url_for('orgs') }}">Organisations</a>
       <a href="{{ url_for('home_reset') }}">Home</a>
+      <a href="{{ url_for('expiring') }}" class="d-flex justify-content-between align-items-center">Expiring soon{% set _es = expiry_summary() %}{% if _es.total %}<span class="badge rounded-pill {{ 'text-bg-danger' if _es.expired else 'text-bg-warning' }} ms-2" title="{{ _es.expired }} expired, {{ _es.soon }} due within 30 days">{{ _es.total }}</span>{% endif %}</a>
 
       {% if active_org %}
       <div class="sidebar-section-title">Org: {{ active_org.name }}</div>
@@ -198,6 +259,12 @@
       <a href="{{ url_for('domains_list') }}">Domains</a>
       <a href="{{ url_for('contacts_list') }}">Contacts</a>
       <a href="{{ url_for('sites_list') }}">Sites</a>
+      {% if custom_types %}
+      <div class="sidebar-section-title">Records</div>
+      {% for t in custom_types %}
+      <a href="{{ url_for('records_list', type_id=t.id) }}">{{ t.label_plural }}</a>
+      {% endfor %}
+      {% endif %}
       {% endif %}
 
       <div class="sidebar-section-title">Account</div>
@@ -207,10 +274,15 @@
       <div class="sidebar-section-title">Admin</div>
       <a href="{{ url_for('admin_users') }}">Users</a>
       <a href="{{ url_for('admin_smtp') }}">SMTP</a>
+      <a href="{{ url_for('admin_types') }}">Record types</a>
+      <a href="{{ url_for('admin_alerts') }}">Expiry alerts</a>
+      <a href="{{ url_for('admin_audit') }}">Audit log</a>
+      <a href="{{ url_for('admin_backups') }}">Backups</a>
 {% endif %}
 
       <div class="sidebar-footer">
-        <div>{{ current_user.email }}</div>
+        <div>{{ current_user.email }}{% if role_name and role_name != 'admin' %} <span class="text-secondary">({{ 'read-only' if role_name == 'readonly' else 'tech' }})</span>{% endif %}</div>
+        <button type="button" class="theme-toggle my-1" id="themeToggle" onclick="cycleTheme()">Theme: Auto</button>
         <a href="{{ url_for('logout') }}" class="text-danger">Logout</a>
       </div>
 
@@ -378,5 +450,26 @@
     });
   </script>
 
+<script>
+  function cycleTheme() {
+    var order = ['auto', 'light', 'dark'], cur = 'auto';
+    try { cur = localStorage.getItem('theme') || 'auto'; } catch (e) {}
+    var next = order[(order.indexOf(cur) + 1) % 3];
+    try { localStorage.setItem('theme', next); } catch (e) {}
+    applyThemeLabel(); 
+    var dark = next === 'dark' || (next === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-bs-theme', dark ? 'dark' : 'light');
+  }
+  function applyThemeLabel() {
+    var b = document.getElementById('themeToggle'); if (!b) return;
+    var cur = 'auto'; try { cur = localStorage.getItem('theme') || 'auto'; } catch (e) {}
+    b.textContent = 'Theme: ' + cur.charAt(0).toUpperCase() + cur.slice(1);
+  }
+  applyThemeLabel();
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+    var cur = 'auto'; try { cur = localStorage.getItem('theme') || 'auto'; } catch (e) {}
+    if (cur === 'auto') document.documentElement.setAttribute('data-bs-theme', window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  });
+</script>
 </body>
 </html>

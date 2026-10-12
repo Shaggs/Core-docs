@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">Record types</h2>
+    <div class="text-muted">Create your own record types with custom fields (licences, backup jobs, VPNs, anything).</div>
+  </div>
+  <a href="{{ url_for('admin_type_new') }}" class="btn btn-primary">New record type</a>
+</div>
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table mb-0 align-middle">
+      <thead class="table-light"><tr><th>Name</th><th>Description</th><th>Fields</th><th>Records</th><th></th></tr></thead>
+      <tbody>
+        {% for t in types %}
+        <tr>
+          <td class="fw-semibold">{{ t.name }}</td>
+          <td class="text-muted">{{ t.description or '—' }}</td>
+          <td>{{ t.fields|length }}</td>
+          <td>{{ counts[t.id] }}</td>
+          <td class="text-end">
+            <a href="{{ url_for('admin_type_edit', type_id=t.id) }}" class="btn btn-sm btn-outline-primary">Edit</a>
+            <form method="post" action="{{ url_for('admin_type_delete', type_id=t.id) }}" class="d-inline"
+                  onsubmit="return confirm('Delete {{ t.name|e }}{% if counts[t.id] %} and its {{ counts[t.id] }} record(s){% endif %}? This cannot be undone.');">
+              {% if counts[t.id] %}<input type="hidden" name="confirm" value="yes">{% endif %}
+              <button class="btn btn-sm btn-outline-danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="p-3 text-muted">No record types yet. Click <strong>New record type</strong> and start from a preset such as Software licence.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

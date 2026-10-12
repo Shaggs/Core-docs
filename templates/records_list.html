@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">{{ t.label_plural }}</h2>
+    <div class="text-muted">{{ org.name }}{% if t.description %} &middot; {{ t.description }}{% endif %}</div>
+  </div>
+  {% if can_write %}<a href="{{ url_for('record_new', type_id=t.id) }}" class="btn btn-primary">Add {{ t.name }}</a>{% endif %}
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-md-4"><input class="form-control" name="q" placeholder="Search {{ t.label_plural|lower }}" value="{{ q }}"></div>
+  <div class="col-auto"><button class="btn btn-outline-secondary">Search</button></div>
+</form>
+
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-hover mb-0 align-middle">
+      <thead class="table-light">
+        <tr><th>Name</th>{% for c in cols %}<th>{{ c.label }}</th>{% endfor %}<th>Updated</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><a href="{{ url_for('record_view', rid=r.id) }}">{{ r.name }}</a></td>
+          {% for c in cols %}
+          {% set v = r.data.get(c.key, '') %}
+          <td>{% if c.type == 'checkbox' %}{{ 'Yes' if v else 'No' }}{% else %}{{ v or '—' }}{% endif %}</td>
+          {% endfor %}
+          <td class="text-muted small">{{ r.updated_at.strftime('%Y-%m-%d') if r.updated_at else '—' }}</td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-secondary" href="{{ url_for('record_view', rid=r.id) }}">View</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ cols|length + 3 }}" class="p-3 text-muted">No {{ t.label_plural|lower }} recorded for this organisation yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

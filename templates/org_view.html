@@ -6,7 +6,10 @@
     <h2 class="mb-0">{{ org.name }}</h2>
     <div class="text-muted">Organisation home</div>
   </div>
-  <button type="button" class="btn btn-primary" onclick="openSearch()">Search</button>
+  <div class="d-flex gap-2">
+    {% if can_write %}<a href="{{ url_for('org_export', org_id=org.id) }}" class="btn btn-outline-primary">Export playbook (PDF)</a>{% endif %}
+    <button type="button" class="btn btn-primary" onclick="openSearch()">Search</button>
+  </div>
 </div>
 {% if current_user.is_super_admin %}<a href="{{ url_for('org_edit', org_id=org.id) }}" class="btn btn-outline-secondary">Edit Organisation</a>{% endif %}
 <div class="card shadow-sm mb-3">

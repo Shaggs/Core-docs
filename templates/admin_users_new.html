@@ -1,1 +1,32 @@
-{% extends "base.html" %}{% block content %}<h2 class="mb-3">Add User</h2><div class="card shadow-sm p-3" style="max-width:600px;"><form method="post"><div class="mb-3"><label class="form-label">Email</label><input class="form-control" type="email" name="email" required></div><div class="mb-3"><label class="form-label">Initial Password</label><input class="form-control" type="password" name="password" required></div><div class="form-check mb-2"><input class="form-check-input" type="checkbox" value="1" id="is_admin" name="is_admin"><label class="form-check-label" for="is_admin">Admin</label></div><div class="form-check mb-3"><input class="form-check-input" type="checkbox" value="1" id="is_super_admin" name="is_super_admin"><label class="form-check-label" for="is_super_admin">Super Admin</label></div><button class="btn btn-success">Create User</button><a href="{{ url_for('admin_users') }}" class="btn btn-secondary">Cancel</a></form></div>{% endblock %}
+{% extends "base.html" %}{% block content %}
+<h2 class="mb-3">Add User</h2>
+{% if link %}
+<div class="alert alert-warning shadow-sm" style="max-width:600px;">
+  <div class="fw-semibold mb-1">{{ created.email }} was created, but the welcome email couldn't be sent.</div>
+  <div class="small mb-2">({{ email_error }}) Copy this set-password link and send it to them another way. It works once, expires in 72 hours, and won't be shown again.</div>
+  <div class="input-group">
+    <input id="welcomeLink" class="form-control" value="{{ link }}" readonly>
+    <button type="button" class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText(document.getElementById('welcomeLink').value); this.textContent='Copied'">Copy</button>
+  </div>
+  <a href="{{ url_for('admin_users') }}" class="btn btn-sm btn-secondary mt-2">Done</a>
+</div>
+{% endif %}
+<div class="card shadow-sm p-3" style="max-width:600px;">
+  <form method="post">
+    <div class="mb-3"><label class="form-label">Email</label>
+      <input class="form-control" type="email" name="email" value="{{ form.email or '' }}" required></div>
+    <div class="mb-3"><label class="form-label">Temporary password <span class="text-muted small">(optional)</span></label>
+      <input class="form-control" type="password" name="password" autocomplete="new-password">
+      <div class="form-text">Recommended: leave blank. They'll be emailed a one-time link to choose their own password (expires in 72 hours).
+        If you set a password here, it is <strong>not</strong> included in the email; give it to them yourself.</div></div>
+    <div class="mb-3"><label class="form-label">Role</label>
+      <select name="role" class="form-select">
+        {% for key, label, desc in roles %}
+        <option value="{{ key }}" {% if key == (form.role or 'tech') %}selected{% endif %}>{{ label }} &mdash; {{ desc }}</option>
+        {% endfor %}
+      </select></div>
+    <button class="btn btn-success">Create User</button>
+    <a href="{{ url_for('admin_users') }}" class="btn btn-secondary">Cancel</a>
+  </form>
+</div>
+{% endblock %}

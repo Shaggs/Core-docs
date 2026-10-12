@@ -5,7 +5,10 @@ __pycache__/
 *.db 
 instance/ 
 uploads/ 
-.env.* 
+.env.*
+!.env.example
 .vscode/
 .idea/
 .DS_Store
+backups/
+*.cvbak

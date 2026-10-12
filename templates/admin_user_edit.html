@@ -30,15 +30,14 @@
         <label class="form-check-label" for="isActive">User Enabled</label>
       </div>
 
-      <div class="form-check mb-2">
-        <input class="form-check-input" type="checkbox" name="is_admin" value="1" id="isAdmin" {% if edit_user.is_admin %}checked{% endif %}>
-        <label class="form-check-label" for="isAdmin">Admin</label>
-      </div>
-
-      <div class="form-check mb-2">
-        <input class="form-check-input" type="checkbox" name="is_super_admin" value="1" id="isSuperAdmin" {% if edit_user.is_super_admin %}checked{% endif %}>
-        <label class="form-check-label" for="isSuperAdmin">Super Admin</label>
-      </div>
+<div class="mb-3">
+  <label class="form-label">Role</label>
+  <select name="role" class="form-select">
+    {% for key, label, desc in roles %}
+    <option value="{{ key }}" {% if key == (cur_role or 'tech') %}selected{% endif %}>{{ label }} &mdash; {{ desc }}</option>
+    {% endfor %}
+  </select>
+</div>
 
       <div class="form-check mb-4">
         <input class="form-check-input" type="checkbox" name="must_change_password" value="1" id="forceReset" {% if edit_user.must_change_password %}checked{% endif %}>

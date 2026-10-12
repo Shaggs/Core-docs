@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">{% if rec %}Edit {{ t.name }}{% else %}Add {{ t.name }}{% endif %} <small class="text-muted fs-6">{{ org.name }}</small></h2>
+<div class="card shadow-sm p-3" style="max-width:760px;">
+  <form method="post" autocomplete="off">
+    <div class="mb-3">
+      <label class="form-label">Name <span class="text-danger">*</span></label>
+      <input class="form-control" name="name" required maxlength="200" value="{{ name }}">
+    </div>
+
+    {% for f in t.fields %}
+    {% set key = 'f_' + f.key %}
+    {% set val = values.get(key, '') %}
+    <div class="mb-3">
+      {% if f.type == 'checkbox' %}
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" name="{{ key }}" value="1" id="{{ key }}" {% if val %}checked{% endif %}>
+        <label class="form-check-label" for="{{ key }}">{{ f.label }}</label>
+      </div>
+      {% else %}
+      <label class="form-label" for="{{ key }}">{{ f.label }}{% if f.required %} <span class="text-danger">*</span>{% endif %}</label>
+      {% if f.type == 'textarea' %}
+        <textarea class="form-control" rows="4" name="{{ key }}" id="{{ key }}">{{ val }}</textarea>
+      {% elif f.type == 'select' %}
+        <select class="form-select" name="{{ key }}" id="{{ key }}">
+          <option value="">—</option>
+          {% for o in f.options %}<option value="{{ o }}" {% if val == o %}selected{% endif %}>{{ o }}</option>{% endfor %}
+        </select>
+      {% elif f.type == 'password' %}
+        <input class="form-control font-monospace" type="password" name="{{ key }}" id="{{ key }}" autocomplete="new-password"
+               placeholder="{% if rec and rec.data.get(f.key) %}(unchanged - type to replace){% endif %}">
+        {% if rec and rec.data.get(f.key) %}
+        <div class="form-check mt-1"><input class="form-check-input" type="checkbox" name="clear_{{ f.key }}" value="1" id="clear_{{ f.key }}">
+          <label class="form-check-label small" for="clear_{{ f.key }}">Clear the stored value</label></div>
+        {% endif %}
+      {% elif f.type == 'date' %}
+        <input class="form-control" type="date" name="{{ key }}" id="{{ key }}" value="{{ val }}">
+      {% elif f.type == 'number' %}
+        <input class="form-control" type="number" step="any" name="{{ key }}" id="{{ key }}" value="{{ val }}">
+      {% else %}
+        <input class="form-control" type="{{ 'url' if f.type == 'url' else 'text' }}" name="{{ key }}" id="{{ key }}" value="{{ val }}">
+      {% endif %}
+      {% if f.type == 'date' and f.alert %}<div class="form-text">You'll get an expiry alert for this date.</div>{% endif %}
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    <button class="btn btn-success">{% if rec %}Save changes{% else %}Add {{ t.name }}{% endif %}</button>
+    <a class="btn btn-secondary" href="{{ url_for('record_view', rid=rec.id) if rec else url_for('records_list', type_id=t.id) }}">Cancel</a>
+  </form>
+</div>
+{% endblock %}

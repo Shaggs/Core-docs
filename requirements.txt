@@ -26,3 +26,16 @@ requests==2.32.3
 
 # Optional but recommended for production
 gunicorn==22.0.0
+
+# Vault encryption (without this, secrets are stored UNENCRYPTED)
+cryptography>=42
+
+# WHOIS / DNS lookups (imported by app.py)
+python-whois>=0.9
+dnspython>=2.6
+
+# PDF merge + AES-256 encryption for playbook export
+pypdf>=4.2
+
+# CSRF protection
+Flask-WTF>=1.2

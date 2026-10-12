@@ -27,7 +27,7 @@
           type="text"
           name="name"
           class="form-control"
-          value="{{ row.name if row else '' }}"
+          value="{{ (row.name or '') if row else '' }}"
           required
         >
       </div>
@@ -40,9 +40,29 @@
           type="text"
           name="url"
           class="form-control"
-          value="{{ row.url if row else '' }}"
+          value="{{ (row.url or '') if row else '' }}"
           placeholder="https://example.com"
         >
+      </div>
+
+      <!-- Folder + tags -->
+      <div class="row g-3 mb-3">
+        <div class="col-md-5">
+          <label class="form-label fw-semibold">Folder <span class="text-muted small fw-normal">(optional)</span></label>
+          <input type="text" name="folder" class="form-control" list="folderOptions" maxlength="100"
+                 value="{{ row.folder or '' if row else '' }}" placeholder="e.g. Network, Microsoft 365">
+          <datalist id="folderOptions">{% for f in folder_options %}<option value="{{ f }}">{% endfor %}</datalist>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label fw-semibold">Tags <span class="text-muted small fw-normal">(comma separated)</span></label>
+          <input type="text" name="tags" id="tagsField" class="form-control" maxlength="500"
+                 value="{{ row.tags or '' if row else '' }}" placeholder="e.g. admin, firewall, MFA">
+          {% if tag_options %}
+          <div class="mt-1 d-flex flex-wrap gap-1">
+            {% for t in tag_options %}<button type="button" class="btn btn-sm btn-outline-secondary py-0 px-2" onclick="addTag(this.textContent)">{{ t }}</button>{% endfor %}
+          </div>
+          {% endif %}
+        </div>
       </div>
 
       <!-- Username -->
@@ -53,7 +73,7 @@
           type="text"
           name="username"
           class="form-control"
-          value="{{ row.username_plain if row else '' }}"
+          value="{{ (row.username_plain or '') if row else '' }}"
           autocomplete="off"
         >
       </div>
@@ -68,7 +88,7 @@
             type="password"
             name="password"
             class="form-control"
-            value="{{ row.password_plain if row else '' }}"
+            value="{{ (row.password_plain or '') if row else '' }}"
             autocomplete="new-password"
           >
 
@@ -79,6 +99,14 @@
           >
             Show / Hide
           </button>
+          <button type="button" class="btn btn-outline-primary" onclick="generatePassword()">Generate</button>
+        </div>
+        <div class="d-flex flex-wrap align-items-center gap-3 mt-2 small">
+          <label class="d-flex align-items-center gap-2 mb-0">Length
+            <input type="number" id="genLength" class="form-control form-control-sm" style="width:5rem" min="8" max="64" value="20"></label>
+          <label class="form-check mb-0"><input type="checkbox" class="form-check-input" id="genSymbols" checked> Symbols</label>
+          <label class="form-check mb-0"><input type="checkbox" class="form-check-input" id="genNoAmbig" checked> Skip look-alikes (0/O, 1/l/I)</label>
+          <span id="genMsg" class="text-success"></span>
         </div>
       </div>
 
@@ -138,7 +166,22 @@
           name="notes"
           class="form-control"
           rows="5"
-        >{{ row.notes if row else '' }}</textarea>
+        >{{ (row.notes or '') if row else '' }}</textarea>
+      </div>
+
+      <!-- Rotation reminder -->
+      <div class="mb-3">
+        <label class="form-label fw-semibold">Rotation reminder</label>
+        <select name="rotate_days" class="form-select" style="max-width:16rem">
+          {% set cur = row.rotate_days if row else 0 %}
+          {% for days, label in rotation_choices %}<option value="{{ days }}" {% if days == cur %}selected{% endif %}>{{ label }}</option>{% endfor %}
+          {% if cur and cur not in rotation_choices|map('first')|list %}<option value="{{ cur }}" selected>Every {{ cur }} days</option>{% endif %}
+        </select>
+        <div class="form-text">
+          Shows on the Expiring page, the badge and the daily alert email when it's time to change this password.
+          {% if row and row.rotation_due_on %}Next change due <strong>{{ row.rotation_due_on.strftime("%Y-%m-%d") }}</strong>.{% endif %}
+          {% if row and row.password_changed_at %}Password last changed {{ row.password_changed_at.strftime("%Y-%m-%d") }}.{% endif %}
+        </div>
       </div>
 
       <!-- Buttons -->
@@ -179,6 +222,37 @@
 </div>
 
 <script>
+function addTag(t) {
+  const f = document.getElementById("tagsField");
+  const cur = f.value.split(",").map(x => x.trim()).filter(Boolean);
+  if (!cur.some(x => x.toLowerCase() === t.trim().toLowerCase())) cur.push(t.trim());
+  f.value = cur.join(", ");
+}
+
+// Strong random password using the browser's cryptographic RNG (nothing is sent to the server until you save).
+function generatePassword() {
+  const len = Math.min(64, Math.max(8, parseInt(document.getElementById("genLength").value) || 20));
+  const noAmbig = document.getElementById("genNoAmbig").checked;
+  let sets = ["ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "0123456789"];
+  if (document.getElementById("genSymbols").checked) sets.push("!@#$%^&*-_=+?.:;");
+  if (noAmbig) sets = sets.map(s => s.replace(/[0O1lI]/g, ""));
+  const all = sets.join("");
+  const pick = (chars) => {               // unbiased: reject values that would skew the modulo
+    const max = 256 - (256 % chars.length), b = new Uint8Array(1);
+    do { crypto.getRandomValues(b); } while (b[0] >= max);
+    return chars[b[0] % chars.length];
+  };
+  const out = sets.map(pick);             // at least one of each kind
+  while (out.length < len) out.push(pick(all));
+  for (let i = out.length - 1; i > 0; i--) {   // shuffle so the guaranteed ones aren't at the start
+    const b = new Uint32Array(1); crypto.getRandomValues(b); const j = b[0] % (i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  const field = document.getElementById("passwordField");
+  field.value = out.join(""); field.type = "text";
+  document.getElementById("genMsg").textContent = "Generated: remember to save.";
+}
+
 function togglePassword() {
 
   const field = document.getElementById("passwordField");

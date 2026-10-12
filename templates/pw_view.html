@@ -9,12 +9,14 @@
 
 <div class="d-flex gap-2">
 
+  {% if can_write %}
   <a href="{{ url_for('pw_edit', pw_id=row.id) }}"
      class="btn btn-primary">
     Edit
   </a>
+  {% endif %}
 
-  <form method="post"
+  {% if can_write %}<form method="post"
         action="{{ url_for('pw_delete', pw_id=row.id) }}"
         onsubmit="return confirm('Delete this password permanently?');"
         style="display:inline;">
@@ -24,7 +26,7 @@
       Delete
     </button>
 
-  </form>
+  </form>{% endif %}
 
   <a href="{{ url_for('pw_list') }}"
      class="btn btn-secondary">
@@ -35,6 +37,19 @@
 </div>
 <div class="card shadow-sm mb-3">
   <div class="card-body">
+
+    {% if row.folder or row.tag_list or row.rotate_days %}
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+      {% if row.folder %}<a href="{{ url_for('pw_list', folder=row.folder) }}" class="badge text-bg-primary text-decoration-none">📁 {{ row.folder }}</a>{% endif %}
+      {% for t in row.tag_list %}<a href="{{ url_for('pw_list', tag=t) }}" class="badge rounded-pill tag-chip text-decoration-none">{{ t }}</a>{% endfor %}
+      {% set due = row.rotation_due_on %}
+      {% if due %}{% set left = (due - today).days %}
+        <span class="badge {{ 'text-bg-danger' if left < 0 else 'text-bg-warning' if left <= 30 else 'text-bg-secondary' }}">
+          {% if left < 0 %}Password change overdue by {{ -left }} day(s){% elif left == 0 %}Password change due today{% else %}Next change due {{ due.strftime("%Y-%m-%d") }}{% endif %}
+        </span>
+      {% endif %}
+    </div>
+    {% endif %}
 
     {% if row.url %}
     <div class="mb-3">
@@ -84,6 +99,78 @@
   </div>
 </div>
 
+{{ related_card('password', row.id) }}
+
+{# ---------- One-time share link ---------- #}
+{% if new_share %}
+<div class="alert alert-success shadow-sm">
+  <div class="fw-semibold mb-1">One-time link ready{% if new_share.emailed %} (also emailed){% endif %}</div>
+  <div class="input-group mb-2">
+    <input id="newShareLink" type="text" class="form-control" value="{{ new_share.url }}" readonly>
+    <button type="button" class="btn btn-outline-success" onclick="navigator.clipboard.writeText(document.getElementById('newShareLink').value); this.textContent='Copied'">Copy</button>
+  </div>
+  <div class="small">Expires {{ new_share.expires_at }} ({{ new_share.minutes }} min) and can be revealed once. This is the only time the link is shown.</div>
+</div>
+{% endif %}
+
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <h5 class="card-title">Share with a client (one-time link)</h5>
+    {% if can_write %}<form method="post" action="{{ url_for('pw_share', pw_id=row.id) }}" class="row g-2 align-items-end">
+      <div class="col-md-3">
+        <label class="form-label small mb-1">Link valid for</label>
+        <select name="expires_minutes" class="form-select">
+          {% for mins, label in share_choices %}
+          <option value="{{ mins }}" {% if mins == share_default %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-4">
+        <label class="form-label small mb-1">Email it to (optional)</label>
+        <input type="email" name="recipient_email" class="form-control" placeholder="client@example.com">
+      </div>
+      <div class="col-md-5">
+        <label class="form-label small mb-1">Message (optional)</label>
+        <input type="text" name="note" maxlength="500" class="form-control" placeholder="e.g. Your new Microsoft 365 login">
+      </div>
+      <div class="col-12">
+        <button class="btn btn-primary">Generate link</button>
+      </div>
+    </form>{% else %}<p class="text-muted small mb-0">Your account is read-only, so you can view share links but not create or revoke them.</p>{% endif %}
+
+    {% if shares %}
+    <div class="table-responsive mt-3">
+      <table class="table table-sm align-middle mb-0">
+        <thead><tr><th>Created</th><th>By</th><th>Sent to</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        {% for item in shares %}
+          {% set s = item.s %}
+          <tr>
+            <td>{{ s.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+            <td>{{ s.created_by_user.email if s.created_by_user else "-" }}</td>
+            <td>{{ s.recipient_email or "-" }}</td>
+            <td>
+              {% if item.status == 'active' %}<span class="badge text-bg-success">Active until {{ s.expires_at.strftime("%H:%M") }} UTC</span>
+              {% elif item.status == 'used' %}<span class="badge text-bg-secondary">Opened {{ s.used_at.strftime("%Y-%m-%d %H:%M") }}{% if s.opened_ip %} ({{ s.opened_ip }}){% endif %}</span>
+              {% elif item.status == 'revoked' %}<span class="badge text-bg-secondary">Revoked</span>
+              {% else %}<span class="badge text-bg-warning">Expired</span>{% endif %}
+            </td>
+            <td class="text-end">
+              {% if item.status == 'active' %}
+              {% if can_write %}<form method="post" action="{{ url_for('pw_share_revoke', pw_id=row.id, share_id=s.id) }}" onsubmit="return confirm('Revoke this link?');">
+                <button class="btn btn-sm btn-outline-danger">Revoke</button>
+              </form>{% endif %}
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
 {% if history %}
 <div class="card shadow-sm">
   <div class="card-body">
@@ -107,9 +194,9 @@
             <td>{{ h.changed_by_user.email if h.changed_by_user else "-" }}</td>
             <td>{{ h.name }}</td>
             <td class="text-end">
-              <form method="post" action="{{ url_for('pw_rollback', pw_id=row.id, history_id=h.id) }}" onsubmit="return confirm('Rollback to this version?');">
+              {% if can_write %}<form method="post" action="{{ url_for('pw_rollback', pw_id=row.id, history_id=h.id) }}" onsubmit="return confirm('Rollback to this version?');">
                 <button class="btn btn-sm btn-outline-warning">Rollback</button>
-              </form>
+              </form>{% endif %}
             </td>
           </tr>
           {% endfor %}

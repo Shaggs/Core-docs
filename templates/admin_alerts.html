@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-1">Expiry alerts</h2>
+<div class="text-muted mb-3">Get one email digest when a domain, warranty or flagged date field enters an alert window. Each item is reported once per window, and again after it's renewed.</div>
+
+{% if not smtp_ok %}
+<div class="alert alert-warning">Email isn't set up yet. Configure it under <a href="{{ url_for('admin_smtp') }}">SMTP</a> before alerts can be sent.</div>
+{% endif %}
+
+<form method="post" class="card shadow-sm p-3 mb-3" style="max-width:760px;">
+  <input type="hidden" name="action" value="save">
+  <div class="form-check form-switch mb-3">
+    <input class="form-check-input" type="checkbox" name="enabled" value="1" id="enabled" {% if st.enabled %}checked{% endif %}>
+    <label class="form-check-label" for="enabled">Send expiry alert emails</label>
+  </div>
+  <div class="mb-3">
+    <label class="form-label">Recipients</label>
+    <textarea class="form-control" rows="2" name="recipients" placeholder="you@example.com, team@example.com">{{ st.recipients or '' }}</textarea>
+  </div>
+  <div class="mb-3">
+    <label class="form-label">Alert when this many days are left</label>
+    <input class="form-control" name="days" value="{{ st.days }}" style="max-width:320px;">
+    <div class="form-text">Comma separated. Items that have already expired are reported once as well.</div>
+  </div>
+  <div><button class="btn btn-success">Save</button></div>
+</form>
+
+<div class="card shadow-sm p-3" style="max-width:760px;">
+  <h5>Run it</h5>
+  <p class="mb-2 small text-muted">
+    {{ preview }} item(s) are currently inside an alert window.
+    {% if st.last_run_at %}Last run {{ st.last_run_at.strftime('%Y-%m-%d %H:%M') }} UTC: {{ st.last_run_summary }}{% else %}It hasn't run yet.{% endif %}
+  </p>
+  <form method="post" class="d-flex gap-2 mb-3">
+    <button name="action" value="run" class="btn btn-outline-primary">Check now</button>
+    <button name="action" value="test" class="btn btn-outline-secondary" title="Sends everything currently in a window, ignoring history">Send a test digest</button>
+  </form>
+  <h6>Run it automatically every day</h6>
+  <p class="small text-muted mb-1">Add this to cron (adjust the path), and set <code>APP_BASE_URL</code> in <code>.env</code> so emails contain links:</p>
+  <pre class="small border rounded p-2 mb-0">0 7 * * *  cd /path/to/Core-docs &amp;&amp; .venv/bin/python send_alerts.py</pre>
+</div>
+{% endblock %}

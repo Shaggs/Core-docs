@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-start mb-3">
+  <div>
+    <div class="text-muted small"><a href="{{ url_for('records_list', type_id=t.id) }}">{{ t.label_plural }}</a> &middot; {{ org.name }}</div>
+    <h2 class="mb-0">{{ r.name }}</h2>
+  </div>
+  {% if can_write %}
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('record_edit', rid=r.id) }}" class="btn btn-primary">Edit</a>
+    <form method="post" action="{{ url_for('record_delete', rid=r.id) }}" onsubmit="return confirm('Delete this {{ t.name|e }}?');">
+      <button class="btn btn-outline-danger">Delete</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card shadow-sm p-3">
+  {% for row in rows %}
+  {% set f = row.f %}
+  <div class="row mb-2">
+    <div class="col-md-3"><strong>{{ f.label }}</strong></div>
+    <div class="col-md-9">
+      {% if f.type == 'password' %}
+        {% if row.has_value %}
+        <span id="pw_{{ f.key }}" class="font-monospace">••••••••</span>
+        <button type="button" class="btn btn-sm btn-outline-secondary ms-2" onclick="revealField('{{ f.key }}', this)">Show</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="copyField('{{ f.key }}', this)">Copy</button>
+        {% else %}—{% endif %}
+      {% elif f.type == 'checkbox' %}
+        {{ 'Yes' if row.value else 'No' }}
+      {% elif f.type == 'url' and row.value and row.value.lower().startswith(('http://', 'https://')) %}
+        <a href="{{ row.value }}" target="_blank" rel="noopener noreferrer">{{ row.value }}</a>
+      {% elif f.type == 'textarea' %}
+        {% if row.value %}<div class="border rounded p-2 bg-light" style="white-space: pre-wrap;">{{ row.value }}</div>{% else %}—{% endif %}
+      {% else %}
+        {{ row.value or '—' }}
+        {% if row.days is not none %}
+          {% if row.days < 0 %}<span class="badge text-bg-danger ms-2">Expired {{ -row.days }} day(s) ago</span>
+          {% elif row.days <= 30 %}<span class="badge text-bg-warning ms-2">In {{ row.days }} day(s)</span>
+          {% else %}<span class="badge text-bg-secondary ms-2">In {{ row.days }} days</span>{% endif %}
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+  <div class="text-muted small mt-2">Last updated {{ r.updated_at.strftime('%Y-%m-%d %H:%M') if r.updated_at else '—' }} UTC</div>
+</div>
+
+{{ related_card('record', r.id) }}
+
+<script>
+  async function fetchSecret(key) {
+    const res = await fetch("{{ url_for('record_secret', rid=r.id, key='__K__') }}".replace('__K__', encodeURIComponent(key)));
+    const data = await res.json();
+    return data.value || '';
+  }
+  async function revealField(key, btn) {
+    const el = document.getElementById('pw_' + key);
+    if (btn.dataset.shown === '1') { el.textContent = '••••••••'; btn.textContent = 'Show'; btn.dataset.shown = '0'; return; }
+    el.textContent = await fetchSecret(key); btn.textContent = 'Hide'; btn.dataset.shown = '1';
+  }
+  async function copyField(key, btn) {
+    await navigator.clipboard.writeText(await fetchSecret(key));
+    const t = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = t, 1200);
+  }
+</script>
+{% endblock %}

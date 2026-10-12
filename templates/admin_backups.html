@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-1">Backups</h2>
+<div class="text-muted mb-3">A backup contains the whole database and every uploaded file. Stored in <code>{{ bdir }}</code>; the newest {{ keep }} are kept.</div>
+
+{% if not sqlite_ok %}
+<div class="alert alert-danger">Backups currently support SQLite databases only.</div>
+{% else %}
+<form method="post" class="card shadow-sm p-3 mb-3" style="max-width:760px;" autocomplete="off">
+  <h5>Create a backup now</h5>
+  <div class="row g-2 mb-2">
+    <div class="col-md-6">
+      <label class="form-label small mb-1">Passphrase (encrypts the file)</label>
+      <input type="password" name="passphrase" class="form-control" autocomplete="new-password"
+             placeholder="{% if env_pass %}Blank = use BACKUP_PASSPHRASE from .env{% else %}At least 10 characters{% endif %}">
+    </div>
+    <div class="col-md-6">
+      <label class="form-label small mb-1">Repeat passphrase</label>
+      <input type="password" name="passphrase2" class="form-control" autocomplete="new-password">
+    </div>
+  </div>
+  <div class="form-check mb-3">
+    <input class="form-check-input" type="checkbox" name="unencrypted" value="1" id="unenc">
+    <label class="form-check-label small" for="unenc">Don't encrypt (the file will contain client documentation in plain form)</label>
+  </div>
+  <div><button class="btn btn-primary">Create backup</button>
+    <span class="text-muted small ms-2">Keep the passphrase somewhere safe. Without it the backup can't be restored.</span></div>
+</form>
+{% endif %}
+
+<div class="card shadow-sm mb-3">
+  <div class="table-responsive">
+    <table class="table mb-0 align-middle">
+      <thead class="table-light"><tr><th>File</th><th>Created (server time)</th><th>Size</th><th>Encrypted</th><th></th></tr></thead>
+      <tbody>
+        {% for b in backups %}
+        <tr>
+          <td class="font-monospace small">{{ b.name }}</td>
+          <td>{{ b.created.strftime('%Y-%m-%d %H:%M') }}</td>
+          <td>{{ b.size|filesizeformat }}</td>
+          <td>{% if b.encrypted %}<span class="badge text-bg-success">Yes</span>{% else %}<span class="badge text-bg-warning">No</span>{% endif %}</td>
+          <td class="text-end">
+            <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin_backup_download', name=b.name) }}">Download</a>
+            <form method="post" action="{{ url_for('admin_backup_delete', name=b.name) }}" class="d-inline" onsubmit="return confirm('Delete this backup?');">
+              <button class="btn btn-sm btn-outline-danger">Delete</button></form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="p-3 text-muted">No backups yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card shadow-sm p-3" style="max-width:760px;">
+  <h5>Automatic nightly backups and restoring</h5>
+  <p class="small text-muted mb-1">Set <code>BACKUP_PASSPHRASE</code> in <code>.env</code>, then add to cron:</p>
+  <pre class="small border rounded p-2">30 2 * * *  cd /path/to/Core-docs &amp;&amp; .venv/bin/python backup.py create</pre>
+  <p class="small text-muted mb-1">To restore (stop the web app first; current data is moved aside, not deleted):</p>
+  <pre class="small border rounded p-2">python backup.py restore {{ backups[0].name if backups else 'coresightvault-backup-YYYYMMDD-HHMMSS.cvbak' }}</pre>
+  <p class="small mb-0"><strong>Also back up your <code>.env</code> file separately.</strong> It holds the key that decrypts stored passwords and is intentionally not inside the backup. Copy backups off this server too (another machine or cloud storage).</p>
+</div>
+{% endblock %}

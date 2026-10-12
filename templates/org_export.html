@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-0">Export playbook</h2>
+    <div class="text-muted">{{ org.name }} &mdash; everything in one PDF</div>
+  </div>
+  <a href="{{ url_for('org_view', org_id=org.id) }}" class="btn btn-secondary">Back</a>
+</div>
+
+{% if not fonts_unicode %}
+<div class="alert alert-info small">
+  Unicode fonts weren't found on this server, so characters outside Western European
+  languages may not print. Anything affected in a password is flagged in the PDF.
+  To fix, put <code>DejaVuSans*.ttf</code> files in a <code>fonts/</code> folder next to <code>app.py</code>.
+</div>
+{% endif %}
+
+<form method="post" class="card shadow-sm" autocomplete="off">
+  <div class="card-body">
+    <h5 class="card-title">Include</h5>
+    <div class="row">
+      {% for key, label in sections if key != 'passwords' %}
+      <div class="col-md-4 mb-2">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="sections" value="{{ key }}" id="sec_{{ key }}" checked>
+          <label class="form-check-label" for="sec_{{ key }}">{{ label }}</label>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="form-check mt-2">
+      <input class="form-check-input" type="checkbox" name="attach_files" value="1" id="attach_files" checked>
+      <label class="form-check-label" for="attach_files">
+        Append uploaded PDFs and images as attachments
+        <span class="text-muted small">(Word/Excel files are listed but can't be embedded)</span>
+      </label>
+    </div>
+
+    <hr>
+    <h5 class="card-title">Passwords &amp; credentials</h5>
+    <div class="form-check">
+      <input class="form-check-input" type="radio" name="credentials" value="none" id="cred_none">
+      <label class="form-check-label" for="cred_none">Don't include a credentials section</label>
+    </div>
+    <div class="form-check">
+      <input class="form-check-input" type="radio" name="credentials" value="list" id="cred_list" checked>
+      <label class="form-check-label" for="cred_list">List credentials without passwords
+        <span class="text-muted small">(names, URLs and usernames only)</span></label>
+    </div>
+    <div class="form-check mb-2">
+      <input class="form-check-input" type="radio" name="credentials" value="full" id="cred_full" {% if not can_export_pw %}disabled{% endif %}>
+      <label class="form-check-label" for="cred_full">Include passwords and 2FA secrets
+        {% if can_export_pw %}<span class="text-muted small">(requires your account password and an encrypted PDF)</span>
+        {% else %}<span class="text-muted small">(administrators only)</span>{% endif %}</label>
+    </div>
+    <div id="pwConfirmBox" class="d-none mb-3">
+      <label class="form-label small mb-1">Confirm your account password</label>
+      <input type="password" name="confirm_password" class="form-control" style="max-width:360px" autocomplete="current-password">
+    </div>
+
+    <h5 class="card-title mt-3">PDF password <span id="pdfPwReq" class="badge text-bg-warning d-none">required</span></h5>
+    <div class="input-group mb-1" style="max-width:520px">
+      <input type="text" id="pdf_password" name="pdf_password" class="form-control font-monospace" placeholder="Leave blank for no encryption" autocomplete="off">
+      <button type="button" class="btn btn-outline-secondary" onclick="genPw()">Generate</button>
+      <button type="button" class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText(document.getElementById('pdf_password').value); this.textContent='Copied'">Copy</button>
+    </div>
+    <div class="form-text mb-3">
+      Encrypts the file with AES-256. Required (12+ characters) when passwords are included.
+      This password is not stored anywhere &mdash; copy it before you export and share it separately from the file.
+    </div>
+
+    <button class="btn btn-primary">Generate PDF</button>
+    <span class="text-muted small ms-2">Large exports with attachments can take a few seconds.</span>
+  </div>
+</form>
+
+<script>
+  const full = document.getElementById('cred_full');
+  function sync() {
+    const on = full && full.checked;
+    document.getElementById('pwConfirmBox')?.classList.toggle('d-none', !on);
+    document.getElementById('pdfPwReq').classList.toggle('d-none', !on);
+    if (on && !document.getElementById('pdf_password').value) genPw();
+  }
+  function genPw() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789-_';
+    const a = new Uint32Array(20); crypto.getRandomValues(a);
+    document.getElementById('pdf_password').value = Array.from(a, n => chars[n % chars.length]).join('');
+  }
+  document.querySelectorAll('input[name=credentials]').forEach(r => r.addEventListener('change', sync));
+</script>
+{% endblock %}

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block content %}
+{% set src = draft if draft else (t if t else None) %}
+<h2 class="mb-3">{% if t %}Edit record type{% else %}New record type{% endif %}</h2>
+
+<form method="post" class="card shadow-sm p-3" id="typeForm" autocomplete="off">
+  {% if not t %}
+  <div class="mb-3" style="max-width:420px;">
+    <label class="form-label">Start from a preset <span class="text-muted small">(optional)</span></label>
+    <select class="form-select" id="presetSel">
+      <option value="">Blank</option>
+      {% for k in presets %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
+    </select>
+  </div>
+  {% endif %}
+
+  <div class="row g-3 mb-3">
+    <div class="col-md-4">
+      <label class="form-label">Name (singular) <span class="text-danger">*</span></label>
+      <input class="form-control" name="name" id="f_name" required maxlength="120" value="{{ src.name if src else '' }}" placeholder="Licence">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Plural</label>
+      <input class="form-control" name="plural" id="f_plural" maxlength="120" value="{{ src.plural if src and src.plural else '' }}" placeholder="Licences">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Description</label>
+      <input class="form-control" name="description" id="f_desc" maxlength="300" value="{{ src.description if src and src.description else '' }}">
+    </div>
+  </div>
+
+  <h5>Fields</h5>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle" id="fieldsTable">
+      <thead><tr><th style="width:26%">Label</th><th style="width:19%">Type</th><th>Dropdown options</th>
+        <th class="text-center">Required</th><th class="text-center">Expiry alert</th><th></th></tr></thead>
+      <tbody id="fieldRows"></tbody>
+    </table>
+  </div>
+  <div class="mb-3"><button type="button" class="btn btn-sm btn-outline-primary" onclick="addRow()">+ Add field</button>
+    <span class="text-muted small ms-2">A record always has a Name. Password fields are stored encrypted. Date fields can send expiry alerts.</span></div>
+
+  <div>
+    <button class="btn btn-success">Save</button>
+    <a href="{{ url_for('admin_types') }}" class="btn btn-secondary">Cancel</a>
+  </div>
+</form>
+
+<script>
+  const TYPES = {{ field_types|tojson }};
+  const INITIAL = {{ (src.fields if src else [])|tojson }};
+  const PRESETS = {{ presets|tojson }};
+  const body = document.getElementById('fieldRows');
+
+  function el(tag, attrs, children) {
+    const e = document.createElement(tag);
+    Object.entries(attrs || {}).forEach(([k, v]) => { if (k === 'class') e.className = v; else e.setAttribute(k, v); });
+    (children || []).forEach(c => e.appendChild(c));
+    return e;
+  }
+  function addRow(f) {
+    f = f || {};
+    const tr = el('tr');
+    const key = el('input', {type: 'hidden', name: 'f_key', value: f.key || ''});
+    const label = el('input', {class: 'form-control form-control-sm', name: 'f_label', maxlength: 80, value: f.label || '', placeholder: 'Field label'});
+    const type = el('select', {class: 'form-select form-select-sm', name: 'f_type'});
+    TYPES.forEach(([k, name]) => { const o = el('option', {value: k}); o.textContent = name; if ((f.type || 'text') === k) o.selected = true; type.appendChild(o); });
+    const opts = el('input', {class: 'form-control form-control-sm', name: 'f_options', value: (f.options || []).join(', '), placeholder: 'Option 1, Option 2'});
+    const reqH = el('input', {type: 'hidden', name: 'f_required', value: f.required ? '1' : '0'});
+    const reqC = el('input', {type: 'checkbox', class: 'form-check-input'}); reqC.checked = !!f.required;
+    reqC.onchange = () => reqH.value = reqC.checked ? '1' : '0';
+    const alH = el('input', {type: 'hidden', name: 'f_alert', value: f.alert ? '1' : '0'});
+    const alC = el('input', {type: 'checkbox', class: 'form-check-input'}); alC.checked = !!f.alert;
+    alC.onchange = () => alH.value = alC.checked ? '1' : '0';
+    function sync() {
+      opts.disabled = type.value !== 'select';
+      alC.disabled = type.value !== 'date';
+      if (alC.disabled) { alC.checked = false; alH.value = '0'; }
+      if (opts.disabled) opts.value = '';
+    }
+    type.onchange = sync;
+    const up = el('button', {type: 'button', class: 'btn btn-sm btn-outline-secondary', title: 'Move up'}); up.textContent = '\u2191';
+    up.onclick = () => { if (tr.previousElementSibling) body.insertBefore(tr, tr.previousElementSibling); };
+    const down = el('button', {type: 'button', class: 'btn btn-sm btn-outline-secondary', title: 'Move down'}); down.textContent = '\u2193';
+    down.onclick = () => { if (tr.nextElementSibling) body.insertBefore(tr.nextElementSibling, tr); };
+    const del = el('button', {type: 'button', class: 'btn btn-sm btn-outline-danger', title: 'Remove'}); del.textContent = '\u00d7';
+    del.onclick = () => tr.remove();
+    tr.appendChild(el('td', {}, [key, label]));
+    tr.appendChild(el('td', {}, [type]));
+    tr.appendChild(el('td', {}, [opts]));
+    tr.appendChild(el('td', {class: 'text-center'}, [reqH, reqC]));
+    tr.appendChild(el('td', {class: 'text-center'}, [alH, alC]));
+    tr.appendChild(el('td', {class: 'text-nowrap text-end'}, [up, document.createTextNode(' '), down, document.createTextNode(' '), del]));
+    body.appendChild(tr);
+    sync();
+  }
+  function loadFields(list) { body.innerHTML = ''; (list.length ? list : [{}]).forEach(addRow); }
+  loadFields(INITIAL);
+
+  const sel = document.getElementById('presetSel');
+  if (sel) sel.onchange = function () {
+    const p = PRESETS[sel.value]; if (!p) return;
+    document.getElementById('f_name').value = p.name;
+    document.getElementById('f_plural').value = p.plural;
+    document.getElementById('f_desc').value = p.description;
+    loadFields(p.fields);
+  };
+</script>
+{% endblock %}

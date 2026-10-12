@@ -1,0 +1,41 @@
+# Quick start:
+#   python3 init_env.py          # once: creates .env with your keys (back it up!)
+#   docker compose up -d --build
+#   open http://localhost:5001   (admin@local / admin, you'll be asked to change it)
+#
+# All data (database, uploads, backups) lives in the "vault-data" Docker volume.
+# Copy backups off the server via Admin -> Backups (Download), or:
+#   docker compose cp vault:/data/backups ./backups-copy
+services:
+  vault:
+    build: .
+    container_name: coresight-vault
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:5001:5001"     # only reachable from this machine; put an HTTPS reverse proxy in front
+    volumes:
+      - vault-data:/data
+
+  # Daily expiry-alert email (after 07:00) and nightly backup (after 02:30), local time from TZ in .env.
+  scheduler:
+    build: .
+    container_name: coresight-vault-jobs
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - vault-data:/data
+    depends_on: [vault]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        alerts=""; backup=""
+        while true; do
+          today=$$(date +%F); now=$$(date +%H%M)
+          if [ "$$now" -ge 0700 ] && [ "$$alerts" != "$$today" ]; then python send_alerts.py; alerts=$$today; fi
+          if [ "$$now" -ge 0230 ] && [ "$$backup" != "$$today" ]; then python backup.py create; backup=$$today; fi
+          sleep 60
+        done
+
+volumes:
+  vault-data:

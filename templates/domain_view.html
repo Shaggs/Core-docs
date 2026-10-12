@@ -7,10 +7,10 @@
     <div class="text-muted">Domain details and live DNS summary</div>
   </div>
   <div class="d-flex gap-2">
-    <form method="post" action="{{ url_for('domain_whois_refresh', domain_id=domain.id) }}">
+    {% if can_write %}<form method="post" action="{{ url_for('domain_whois_refresh', domain_id=domain.id) }}">
       <button class="btn btn-outline-secondary">Refresh WHOIS</button>
-    </form>
-    <a href="{{ url_for('domain_edit', domain_id=domain.id) }}" class="btn btn-primary">Edit</a>
+    </form>{% endif %}
+    {% if can_write %}<a href="{{ url_for('domain_edit', domain_id=domain.id) }}" class="btn btn-primary">Edit</a>{% endif %}
     <a href="{{ url_for('domains_list') }}" class="btn btn-secondary">Back</a>
   </div>
 </div>
@@ -143,8 +143,9 @@
 </div>
 
 <div class="d-flex gap-2">
-  <form method="post" action="{{ url_for('domain_delete', domain_id=domain.id) }}" onsubmit="return confirm('Delete this domain?');">
+  {% if can_write %}<form method="post" action="{{ url_for('domain_delete', domain_id=domain.id) }}" onsubmit="return confirm('Delete this domain?');">
     <button class="btn btn-outline-danger">Delete</button>
-  </form>
+  </form>{% endif %}
 </div>
+{{ related_card('domain', domain.id) }}
 {% endblock %}

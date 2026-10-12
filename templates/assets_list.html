@@ -5,7 +5,7 @@
     <h2 class="mb-0">Assets</h2>
     <div class="text-muted">Asset register with assignment and status</div>
   </div>
-  <a href="{{ url_for('assets_new') }}" class="btn btn-primary">New Asset</a>
+  {% if can_write %}<a href="{{ url_for('assets_new') }}" class="btn btn-primary">New Asset</a>{% endif %}
 </div>
 
 <div class="card shadow-sm">

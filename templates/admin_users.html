@@ -68,20 +68,12 @@
             <!-- Role -->
             <td>
 
-              {% if u.is_super_admin %}
-                <span class="badge bg-dark">
-                  Super Admin
-                </span>
-
-              {% elif u.is_admin %}
-                <span class="badge bg-primary">
-                  Admin
-                </span>
-
+              {% if u.is_super_admin or u.is_admin %}
+                <span class="badge text-bg-danger">Admin</span>
+              {% elif u.role == 'readonly' %}
+                <span class="badge bg-secondary">Read-only</span>
               {% else %}
-                <span class="badge bg-secondary">
-                  User
-                </span>
+                <span class="badge bg-primary">Technician</span>
               {% endif %}
 
             </td>

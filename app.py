@@ -5,6 +5,9 @@ import smtplib
 import base64
 import csv
 import hashlib
+import hmac
+import json
+import re
 import io
 from email.message import EmailMessage
 from datetime import datetime, timedelta, date
@@ -29,6 +32,8 @@ from flask_login import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+import playbook
+from flask_wtf.csrf import CSRFProtect, CSRFError, generate_csrf
 
 try:
     import whois as pywhois
@@ -47,8 +52,14 @@ except Exception:
     InvalidToken = Exception
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_ROOT = BASE_DIR / "uploads"
-UPLOAD_ROOT.mkdir(exist_ok=True)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except Exception:
+    pass
+UPLOAD_ROOT = Path(os.environ.get("UPLOAD_DIR") or (BASE_DIR / "uploads"))   # override for tests / separate data disk
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-now")
@@ -57,8 +68,28 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 50 * 1024 * 1024))
 app.config["RESET_TOKEN_SALT"] = "password-reset-salt"
 app.config["VAULT_KEY"] = os.environ.get("VAULT_KEY")
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"      # browsers won't send the login cookie on cross-site POSTs
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", os.environ.get("BEHIND_PROXY", "0")) == "1"
+app.config["WTF_CSRF_TIME_LIMIT"] = None           # token lasts as long as the session
+
+if os.environ.get("BEHIND_PROXY") == "1":
+    # Set BEHIND_PROXY=1 when running behind nginx/Caddy/Traefik so that
+    # share links use https:// and audit logs record the real client IP.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+if app.config["SECRET_KEY"] == "change-this-now":
+    print("WARNING: SECRET_KEY is not set. Run `python init_env.py` to generate a .env file.")
+if not app.config["VAULT_KEY"]:
+    print("WARNING: VAULT_KEY is not set; secrets are encrypted with a key derived from SECRET_KEY. "
+          "Run `python init_env.py`, and never change these keys once data has been saved.")
+
+# Print empty values as nothing rather than the word "None" (forms were saving "None" back as text).
+app.jinja_env.finalize = lambda v: "" if v is None else v
 
 db = SQLAlchemy(app)
+csrf = CSRFProtect(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
@@ -132,6 +163,7 @@ class User(db.Model, UserMixin):
     locked_until = db.Column(db.DateTime, nullable=True)
     must_change_password = db.Column(db.Boolean, default=False)
     last_login_at = db.Column(db.DateTime, nullable=True)
+    role = db.Column(db.String(20), nullable=True)   # admin | tech | readonly
 
 
 
@@ -159,6 +191,22 @@ class Password(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
     updated_by_user = db.relationship("User", foreign_keys=[updated_by])
+    folder = db.Column(db.String(100), nullable=True)            # e.g. "Network", "Microsoft 365"
+    tags = db.Column(db.String(500), nullable=True)              # comma separated
+    rotate_days = db.Column(db.Integer, nullable=True)           # remind to change every N days
+    password_changed_at = db.Column(db.DateTime, nullable=True)  # when the secret itself last changed
+
+    @property
+    def tag_list(self):
+        return parse_tags(self.tags)
+
+    @property
+    def rotation_due_on(self):
+        """Date the password should next be changed, or None if no reminder is set."""
+        if not self.rotate_days:
+            return None
+        base = self.password_changed_at or self.updated_at
+        return (base.date() + timedelta(days=self.rotate_days)) if base else None
 
 class PasswordHistory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -184,6 +232,10 @@ class PasswordShareLink(db.Model):
     used_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     created_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    note = db.Column(db.String(500), nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    opened_ip = db.Column(db.String(64), nullable=True)
+    created_by_user = db.relationship("User", foreign_keys=[created_by])
 
 class Domain(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -267,7 +319,80 @@ class Asset(db.Model):
     asset_id = db.Column(db.String(200), nullable=True)
     location = db.Column(db.String(200), nullable=True)
     issued_to = db.Column(db.String(200), nullable=True)
+    warranty_expires = db.Column(db.Date, nullable=True)
     notes = db.Column(db.Text, nullable=True)
+
+
+# ---------------- Custom record types, links, alerts ----------------
+class CustomType(db.Model):
+    """An admin-defined record type (e.g. Licence, Backup job, VPN) with its own fields."""
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), unique=True, nullable=False)
+    plural = db.Column(db.String(120), nullable=True)
+    description = db.Column(db.String(300), nullable=True)
+    fields_json = db.Column(db.Text, nullable=False, default="[]")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    @property
+    def fields(self):
+        try:
+            return json.loads(self.fields_json or "[]")
+        except Exception:
+            return []
+
+    @property
+    def label_plural(self):
+        return self.plural or (self.name + "s")
+
+
+class CustomRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False, index=True)
+    type_id = db.Column(db.Integer, db.ForeignKey("custom_type.id"), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    data_json = db.Column(db.Text, nullable=False, default="{}")   # password-type fields are stored encrypted
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    updated_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    ctype = db.relationship("CustomType")
+
+    @property
+    def data(self):
+        try:
+            return json.loads(self.data_json or "{}")
+        except Exception:
+            return {}
+
+
+class RecordLink(db.Model):
+    """Generic two-way link between any two records in the same organisation."""
+    id = db.Column(db.Integer, primary_key=True)
+    org_id = db.Column(db.Integer, db.ForeignKey("organization.id"), nullable=False, index=True)
+    a_type = db.Column(db.String(20), nullable=False)
+    a_id = db.Column(db.Integer, nullable=False)
+    b_type = db.Column(db.String(20), nullable=False)
+    b_id = db.Column(db.Integer, nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (db.UniqueConstraint("a_type", "a_id", "b_type", "b_id", name="uq_record_link"),)
+
+
+class AlertSetting(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    enabled = db.Column(db.Boolean, default=False, nullable=False)
+    recipients = db.Column(db.Text, nullable=True)                 # comma / newline separated
+    days = db.Column(db.String(100), nullable=False, default="60,30,14,7,1")
+    last_run_at = db.Column(db.DateTime, nullable=True)
+    last_run_summary = db.Column(db.String(300), nullable=True)
+
+
+class AlertSent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    item_key = db.Column(db.String(200), nullable=False, index=True)   # includes the expiry date, so a renewal re-arms it
+    threshold = db.Column(db.Integer, nullable=False)
+    sent_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (db.UniqueConstraint("item_key", "threshold", name="uq_alert_sent"),)
+
 
 class SMTPSettings(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -374,6 +499,29 @@ def _snippet(text, q, radius=80):
     if end < len(text):
         snippet = snippet + "..."
     return snippet
+
+MAX_TAGS = 20
+ROTATION_CHOICES = [(0, "No reminder"), (30, "Every 30 days"), (60, "Every 60 days"), (90, "Every 90 days"),
+                    (180, "Every 6 months"), (365, "Every year")]
+
+def parse_tags(text):
+    """'VPN, admin ,vpn' -> ['VPN', 'admin'] (trimmed, de-duplicated ignoring case, max 20 x 40 chars)."""
+    out, seen = [], set()
+    for t in (text or "").split(","):
+        t = re.sub(r"\s+", " ", t).strip()[:40]
+        if t and t.lower() not in seen:
+            seen.add(t.lower()); out.append(t)
+    return out[:MAX_TAGS]
+
+def password_meta_from_form(form):
+    """Folder / tags / rotation fields shared by the new + edit forms."""
+    folder = re.sub(r"\s+", " ", (form.get("folder") or "")).strip()[:100] or None
+    tags = ", ".join(parse_tags(form.get("tags"))) or None
+    try:
+        days = int(form.get("rotate_days") or 0)
+    except ValueError:
+        days = 0
+    return folder, tags, (days if 0 < days <= 3650 else None)
 
 def _get_vault_cipher():
     if Fernet is None:
@@ -553,7 +701,16 @@ def active_org():
 
 @app.context_processor
 def inject_globals():
-    return {"active_org": active_org()}
+    ctx = {"active_org": active_org(), "role_name": None, "can_write": True, "custom_types": []}
+    if current_user.is_authenticated:
+        r = user_role(current_user)
+        ctx["role_name"] = r
+        ctx["can_write"] = r != "readonly"
+        try:
+            ctx["custom_types"] = CustomType.query.order_by(CustomType.name).all()
+        except Exception:
+            pass
+    return ctx
 
 def require_active_org():
     org = active_org()
@@ -624,14 +781,33 @@ def send_email(to_email, subject, body):
 def serializer():
     return URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
-def generate_reset_token(email):
-    return serializer().dumps(email, salt=app.config["RESET_TOKEN_SALT"])
+RESET_LINK_MAX_AGE = 3600            # "forgot password" links: 1 hour
+WELCOME_LINK_MAX_AGE = 72 * 3600     # new-user "set your password" links: 72 hours
+WELCOME_TOKEN_SALT = "welcome-set-password"
 
-def verify_reset_token(token, max_age=3600):
-    try:
-        return serializer().loads(token, salt=app.config["RESET_TOKEN_SALT"], max_age=max_age)
-    except (BadSignature, SignatureExpired):
-        return None
+def _pw_fingerprint(user):
+    # Changes whenever the password changes, so every emailed link works only once.
+    return hashlib.sha256((user.password_hash or "").encode()).hexdigest()[:16]
+
+def generate_reset_token(user, welcome=False):
+    salt = WELCOME_TOKEN_SALT if welcome else app.config["RESET_TOKEN_SALT"]
+    return serializer().dumps({"e": user.email, "h": _pw_fingerprint(user)}, salt=salt)
+
+def verify_reset_token(token):
+    """Return (user, is_welcome) for a valid, unused link, else (None, False)."""
+    for salt, max_age, welcome in ((app.config["RESET_TOKEN_SALT"], RESET_LINK_MAX_AGE, False),
+                                   (WELCOME_TOKEN_SALT, WELCOME_LINK_MAX_AGE, True)):
+        try:
+            data = serializer().loads(token, salt=salt, max_age=max_age)
+        except (BadSignature, SignatureExpired):
+            continue
+        if not isinstance(data, dict):
+            return None, False
+        user = User.query.filter_by(email=data.get("e")).first()
+        if user and user.is_active_user and hmac.compare_digest(str(data.get("h")), _pw_fingerprint(user)):
+            return user, welcome
+        return None, False
+    return None, False
 
 def _to_date(value):
     if not value:
@@ -707,6 +883,68 @@ def enforce_password_change():
     if current_user.is_authenticated and current_user.must_change_password:
         if request.endpoint not in allowed_endpoints:
             return redirect(url_for("change_password"))
+
+# ---------------- Roles ----------------
+ROLES = [
+    ("admin", "Admin", "Everything, including users, system settings, backups and password exports."),
+    ("tech", "Technician", "Create, edit, delete and share client records. No user or system settings."),
+    ("readonly", "Read-only", "View only. Cannot create, edit, delete, share or export."),
+]
+ROLE_KEYS = {r[0] for r in ROLES}
+READONLY_POST_OK = {"login", "login_mfa", "logout", "change_password", "forgot_password",
+                    "reset_password", "account", "setup_2fa", "static"}
+
+def user_role(u):
+    if u.is_super_admin or u.is_admin:
+        return "admin"
+    return u.role if u.role in ("tech", "readonly") else "tech"
+
+def apply_role(u, role):
+    role = role if role in ROLE_KEYS else "tech"
+    u.role = role
+    u.is_admin = u.is_super_admin = (role == "admin")
+
+def other_active_admins(exclude_user_id):
+    return User.query.filter(User.id != exclude_user_id, User.is_active_user.is_(True),
+                             db.or_(User.is_super_admin.is_(True), User.is_admin.is_(True))).count()
+
+@app.before_request
+def enforce_roles():
+    if not current_user.is_authenticated or user_role(current_user) != "readonly":
+        return
+    if request.method in ("GET", "HEAD", "OPTIONS") or request.endpoint in READONLY_POST_OK:
+        return
+    log_audit("denied", "role", None, details=f"Read-only user blocked: {request.method} {request.path}")
+    if request.headers.get("X-Requested-With"):
+        return jsonify({"success": False, "error": "Your account is read-only."}), 403
+    flash("Your account is read-only, so that change wasn't made.", "warning")
+    return redirect(request.referrer or url_for("orgs"))
+
+# ---------------- CSRF ----------------
+_FORM_POST_RE = re.compile(r'(<form\b[^>]*\bmethod\s*=\s*["\']?post["\']?[^>]*>)', re.I)
+
+@app.after_request
+def inject_csrf_tokens(resp):
+    """Add the CSRF token to every POST form in rendered pages, so templates don't each need it."""
+    try:
+        if (resp.mimetype != "text/html" or resp.direct_passthrough or resp.status_code >= 400
+                or request.endpoint in ("pw_share_open", "static")):
+            return resp
+        html = resp.get_data(as_text=True)
+        if "<form" not in html.lower() or 'name="csrf_token"' in html:
+            return resp
+        field = f'<input type="hidden" name="csrf_token" value="{generate_csrf()}">'
+        resp.set_data(_FORM_POST_RE.sub(lambda m: m.group(1) + field, html))
+    except Exception:
+        app.logger.exception("CSRF token injection failed")
+    return resp
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    if request.headers.get("X-Requested-With"):
+        return jsonify({"success": False, "error": "Session expired. Reload the page and try again."}), 400
+    flash("Your session expired or the form was invalid. Please try again.", "warning")
+    return redirect(request.referrer or url_for("orgs"))
 
 ONBOARDING_FIELDS = [
     ("welcome_package_given", "Welcome package given"),
@@ -932,7 +1170,7 @@ def forgot_password():
         user = User.query.filter_by(email=email).first()
         if user:
             try:
-                token = generate_reset_token(user.email)
+                token = generate_reset_token(user)
                 reset_url = url_for("reset_password", token=token, _external=True)
                 send_email(user.email, "Password Reset Request", f"Use this link to reset your password:\n\n{reset_url}")
             except Exception as e:
@@ -944,51 +1182,57 @@ def forgot_password():
 
 @app.route("/reset-password/<token>", methods=["GET", "POST"])
 def reset_password(token):
-    email = verify_reset_token(token)
-    if not email:
-        flash("Reset link is invalid or expired.", "danger")
-        return redirect(url_for("forgot_password"))
-    user = User.query.filter_by(email=email).first()
+    user, welcome = verify_reset_token(token)
     if not user:
-        flash("Invalid reset request.", "danger")
+        flash("This link is invalid, has expired, or has already been used. Request a new one below, "
+              "or ask your administrator.", "danger")
         return redirect(url_for("forgot_password"))
     if request.method == "POST":
         pw = request.form.get("password") or ""
         confirm = request.form.get("confirm_password") or ""
         if pw != confirm:
             flash("Passwords do not match.", "warning")
-            return render_template("reset_password.html")
+            return render_template("reset_password.html", welcome=welcome, email=user.email)
         if not password_meets_policy(pw):
-            flash("Password does not meet complexity policy.", "warning")
-            return render_template("reset_password.html")
+            flash("Password must be at least 10 characters and use 3 of: upper case, lower case, numbers, symbols.", "warning")
+            return render_template("reset_password.html", welcome=welcome, email=user.email)
         user.set_password(pw)
         user.must_change_password = False
         user.failed_logins = 0
         user.locked_until = None
         db.session.commit()
-        flash("Password reset complete.", "success")
+        log_audit("set_password" if welcome else "reset_password", "user", user.id,
+                  details=("Set initial password via welcome link" if welcome else "Reset password via email link"), user_id=user.id)
+        flash("Password set. You can now sign in." if welcome else "Password reset complete.", "success")
         return redirect(url_for("login"))
-    return render_template("reset_password.html")
+    return render_template("reset_password.html", welcome=welcome, email=user.email)
 
 @app.route("/change-password", methods=["GET", "POST"])
 @login_required
 def change_password():
+    force = bool(current_user.must_change_password)
     if request.method == "POST":
-        new_password = request.form.get("password")
-        confirm_password = request.form.get("confirm_password")
+        current_pw = request.form.get("current_password") or ""
+        new_password = request.form.get("new_password") or ""
+        confirm_password = request.form.get("confirm_password") or ""
 
-        if not new_password or new_password != confirm_password:
-            flash("Passwords do not match.", "danger")
-            return render_template("change_password.html")
-
-        current_user.set_password(new_password)
-        current_user.must_change_password = False
-        db.session.commit()
-
-        flash("Password changed successfully.", "success")
-        return redirect(url_for("dashboard"))
-
-    return render_template("change_password.html")
+        if not current_user.check_password(current_pw):
+            flash("Your current password is incorrect.", "danger")
+        elif new_password != confirm_password:
+            flash("New passwords do not match.", "danger")
+        elif new_password == current_pw:
+            flash("Choose a password different from your current one.", "danger")
+        elif not password_meets_policy(new_password):
+            flash("Password must be at least 10 characters and include at least 3 of: "
+                  "uppercase, lowercase, number, symbol.", "danger")
+        else:
+            current_user.set_password(new_password)
+            current_user.must_change_password = False
+            db.session.commit()
+            log_audit("change_password", "user", current_user.id, details="Password changed")
+            flash("Password changed successfully.", "success")
+            return redirect(url_for("orgs"))
+    return render_template("change_password.html", force_change=force)
 
 
 @app.route("/setup-2fa")
@@ -1008,9 +1252,15 @@ def admin_user_edit(user_id):
 
     if request.method == "POST":
         edit_user.email = (request.form.get("email") or "").strip().lower()
-        edit_user.is_super_admin = True if request.form.get("is_super_admin") else False
-        edit_user.is_admin = True if request.form.get("is_admin") else False
-        edit_user.is_active_user = True if request.form.get("is_active_user") else False
+        new_role = request.form.get("role") or user_role(edit_user)
+        new_active = True if request.form.get("is_active_user") else False
+        if (user_role(edit_user) == "admin" and edit_user.is_active_user
+                and (new_role != "admin" or not new_active)
+                and other_active_admins(edit_user.id) == 0):
+            flash("You can't demote or disable the only active admin.", "danger")
+            return render_template("admin_user_edit.html", edit_user=edit_user, roles=ROLES, cur_role=user_role(edit_user))
+        apply_role(edit_user, new_role)
+        edit_user.is_active_user = new_active
         edit_user.must_change_password = True if request.form.get("must_change_password") else False
 
         new_password = request.form.get("new_password") or ""
@@ -1018,7 +1268,7 @@ def admin_user_edit(user_id):
         if new_password:
             if not password_meets_policy(new_password):
                 flash("Password does not meet policy.", "warning")
-                return render_template("admin_user_edit.html", edit_user=edit_user)
+                return render_template("admin_user_edit.html", edit_user=edit_user, roles=ROLES, cur_role=user_role(edit_user))
 
             edit_user.set_password(new_password)
             edit_user.must_change_password = True
@@ -1036,7 +1286,7 @@ def admin_user_edit(user_id):
         flash("User updated.", "success")
         return redirect(url_for("admin_users"))
 
-    return render_template("admin_user_edit.html", edit_user=edit_user)
+    return render_template("admin_user_edit.html", edit_user=edit_user, roles=ROLES, cur_role=user_role(edit_user))
 
 @app.route("/login/mfa", methods=["GET", "POST"])
 def login_mfa():
@@ -1152,7 +1402,7 @@ def org_view(org_id):
     session["active_org_id"] = org.id
 
     next_url = request.args.get("next")
-    if next_url:
+    if next_url and next_url.startswith("/") and not next_url.startswith("//") and "\\" not in next_url:
         return redirect(next_url)
 
     dashboard_data = get_dashboard_data(org.id)
@@ -1188,8 +1438,33 @@ def pw_list():
     org = require_active_org()
     if not org:
         return redirect(url_for("orgs"))
-    rows = Password.query.filter_by(org_id=org.id).order_by(Password.name.asc()).all()
-    return render_template("pw_list.html", org=org, passwords=rows)
+    all_rows = Password.query.filter_by(org_id=org.id).order_by(Password.name.asc()).all()
+    folder = request.args.get("folder")          # None = all, "" = no folder
+    tag = (request.args.get("tag") or "").strip()
+    q = (request.args.get("q") or "").strip().lower()
+    rows = all_rows
+    if folder is not None:
+        rows = [r for r in rows if (r.folder or "") == folder]
+    if tag:
+        rows = [r for r in rows if tag.lower() in (t.lower() for t in r.tag_list)]
+    if q:
+        rows = [r for r in rows if q in (r.name or "").lower() or q in (r.url or "").lower()
+                or q in (r.folder or "").lower() or any(q in t.lower() for t in r.tag_list)]
+    groups = {}
+    for r in rows:
+        groups.setdefault(r.folder or "", []).append(r)
+    grouped = sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0].lower()))   # "no folder" last
+    folders = sorted({r.folder for r in all_rows if r.folder}, key=str.lower)
+    tag_counts = {}
+    for r in all_rows:
+        for t in r.tag_list:
+            k = t.lower()
+            tag_counts[k] = (tag_counts.get(k, (t, 0))[0], tag_counts.get(k, (t, 0))[1] + 1)
+    all_tags = sorted(tag_counts.values(), key=lambda tc: tc[0].lower())
+    today = date.today()
+    return render_template("pw_list.html", org=org, passwords=rows, grouped=grouped, folders=folders,
+                           all_tags=all_tags, cur_folder=folder, cur_tag=tag, q=request.args.get("q") or "",
+                           today=today, total=len(all_rows))
 
 @app.route("/passwords/new", methods=["GET", "POST"])
 @login_required
@@ -1205,19 +1480,21 @@ def pw_new():
             password_plain=encrypt_secret(request.form.get("password") or None),
             url=request.form.get("url") or None,
             notes=request.form.get("notes") or None,
-            otp_secret=encrypt_secret((request.form.get("otp_secret") or "").strip() or None),
+            otp_secret=encrypt_secret((request.form.get("otp_secret") or "").replace(" ", "").strip().upper() or None),
             updated_at=datetime.utcnow(),
             updated_by=current_user.id
         )
+        p.folder, p.tags, p.rotate_days = password_meta_from_form(request.form)
+        p.password_changed_at = datetime.utcnow() if request.form.get("password") else None
         if not p.name:
             flash("Name required.", "warning")
-            return render_template("pw_edit.html", org=org, row=None)
+            return render_template("pw_edit.html", org=org, row=None, **pw_form_context(org))
         db.session.add(p)
         db.session.commit()
         log_audit("create", "password", p.id, org_id=org.id, details=f"Created password: {p.name}")
         flash("Password created.", "success")
         return redirect(url_for("pw_view", pw_id=p.id))
-    return render_template("pw_edit.html", org=org, row=None)
+    return render_template("pw_edit.html", org=org, row=None, **pw_form_context(org))
 
 @app.route("/passwords/import", methods=["GET", "POST"])
 @login_required
@@ -1282,6 +1559,9 @@ def pw_import():
                 otp_secret=encrypt_secret(row.get("otp_secret") or None),
                 updated_at=datetime.utcnow(),
                 updated_by=current_user.id,
+                folder=(re.sub(r"\s+", " ", row.get("folder") or "").strip()[:100] or None),
+                tags=(", ".join(parse_tags(row.get("tags"))) or None),
+                password_changed_at=(datetime.utcnow() if row.get("password") else None),
             ))
     except (csv.Error, ValueError) as exc:
         flash(f"Unable to import CSV: {exc}", "danger")
@@ -1358,18 +1638,27 @@ def pw_edit(pw_id):
             .upper()
         )
 
+        new_pw = request.form.get("password") or ""
+        if new_pw != decrypt_secret(row.password_plain):
+            row.password_changed_at = datetime.utcnow()      # restarts the rotation reminder
         row.name = (request.form.get("name") or "").strip()
         row.username_plain = encrypt_secret(request.form.get("username") or None)
-        row.password_plain = encrypt_secret(request.form.get("password") or None)
-        row.otp_secret = encrypt_secret(otp_secret or None)
+        row.password_plain = encrypt_secret(new_pw or None)
+        # The form never shows the existing 2FA secret, so a blank box means "keep it".
+        if request.form.get("clear_otp") == "1":
+            row.otp_secret = None
+        elif otp_secret:
+            row.otp_secret = encrypt_secret(otp_secret)
         row.url = request.form.get("url") or None
         row.notes = request.form.get("notes") or None
+        row.folder, row.tags, row.rotate_days = password_meta_from_form(request.form)
         row.updated_at = datetime.utcnow()
         row.updated_by = current_user.id
 
         if not row.name:
+            db.session.rollback()
             flash("Name required.", "warning")
-            return render_template("pw_edit.html", org=org, row=row)
+            return redirect(url_for("pw_edit", pw_id=pw_id))
 
         db.session.commit()
         log_audit("update", "password", row.id, org_id=org.id, details=f"Updated password: {row.name}")
@@ -1382,11 +1671,23 @@ def pw_edit(pw_id):
         "url": row.url,
         "username_plain": decrypt_secret(row.username_plain),
         "password_plain": decrypt_secret(row.password_plain),
-        "otp_secret": decrypt_secret(row.otp_secret),
+        "has_otp": bool(row.otp_secret),
         "notes": row.notes,
+        "folder": row.folder,
+        "tags": row.tags,
+        "rotate_days": row.rotate_days or 0,
+        "rotation_due_on": row.rotation_due_on,
+        "password_changed_at": row.password_changed_at,
     }
 
-    return render_template("pw_edit.html", org=org, row=edit_row)
+    return render_template("pw_edit.html", org=org, row=edit_row, **pw_form_context(org))
+
+def pw_form_context(org):
+    """Suggestions for the folder/tag boxes: what this client already uses."""
+    rows = Password.query.filter_by(org_id=org.id).with_entities(Password.folder, Password.tags).all()
+    folders = sorted({f for f, _ in rows if f}, key=str.lower)
+    tags = sorted({t for _, ts in rows for t in parse_tags(ts)}, key=str.lower)
+    return {"folder_options": folders, "tag_options": tags, "rotation_choices": ROTATION_CHOICES}
 
 @app.route("/passwords/<int:pw_id>/view")
 @login_required
@@ -1399,7 +1700,20 @@ def pw_view(pw_id):
         flash("Password not found.", "danger")
         return redirect(url_for("pw_list"))
     history = PasswordHistory.query.filter_by(password_id=row.id).order_by(PasswordHistory.changed_at.desc()).all()
-    return render_template("pw_view.html", org=org, row=row, history=history)
+    now = datetime.utcnow()
+    shares = [
+        {"s": s, "status": share_status(s, now)}
+        for s in PasswordShareLink.query.filter_by(password_id=row.id)
+        .order_by(PasswordShareLink.created_at.desc()).limit(15).all()
+    ]
+    new_share = session.pop("new_share_link", None)
+    if new_share and new_share.get("pw_id") != row.id:
+        new_share = None
+    return render_template(
+        "pw_view.html", org=org, row=row, history=history, today=date.today(),
+        shares=shares, new_share=new_share, share_choices=SHARE_EXPIRY_CHOICES,
+        share_default=SHARE_DEFAULT_MINUTES,
+    )
 
 @app.route("/passwords/<int:pw_id>/delete", methods=["POST"])
 @login_required
@@ -1411,8 +1725,10 @@ def pw_delete(pw_id):
     if not row or row.org_id != org.id:
         flash("Password not found.", "danger")
         return redirect(url_for("pw_list"))
+    PasswordShareLink.query.filter_by(password_id=row.id).delete()
     db.session.delete(row)
     db.session.commit()
+    log_audit("delete", "password", pw_id, org_id=org.id, details=f"Deleted password: {row.name}")
     flash("Password deleted.", "success")
     return redirect(url_for("pw_list"))
 
@@ -1460,6 +1776,47 @@ def pw_secret(pw_id):
     if not org or not row or row.org_id != org.id:
         return jsonify({"error": "not found"}), 404
 
+    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
+    resp = jsonify({
+        "username": decrypt_secret(row.username_plain) or "",
+        "password": decrypt_secret(row.password_plain) or "",
+        "otp_secret": decrypt_secret(row.otp_secret) or ""
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------------- One-time password sharing ----------------
+# Flow: staff create a link (default 5 min) -> recipient opens it and sees a
+# confirmation page (GET never consumes the link, so email scanners/previews
+# can't burn it) -> recipient clicks "Reveal" (POST) -> link is atomically
+# consumed and the secret is shown once, with an on-screen countdown.
+SHARE_EXPIRY_CHOICES = [(5, "5 minutes"), (15, "15 minutes"), (60, "1 hour"), (1440, "24 hours")]
+SHARE_DEFAULT_MINUTES = 5
+SHARE_MAX_MINUTES = 1440
+SHARE_VIEW_SECONDS = 300  # how long the revealed secret stays on screen
+
+def _share_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def share_status(share, now=None):
+    now = now or datetime.utcnow()
+    if share.revoked_at is not None:
+        return "revoked"
+    if share.used_at is not None:
+        return "used"
+    if now > share.expires_at:
+        return "expired"
+    return "active"
+
+def _share_response(html):
+    resp = app.make_response(html)
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
 @app.route("/passwords/<int:pw_id>/share", methods=["POST"])
 @login_required
 def pw_share(pw_id):
@@ -1472,69 +1829,305 @@ def pw_share(pw_id):
         return redirect(url_for("pw_list"))
 
     recipient_email = (request.form.get("recipient_email") or "").strip() or None
+    note = (request.form.get("note") or "").strip()[:500] or None
     try:
-        expires_minutes = int((request.form.get("expires_minutes") or "60").strip())
+        expires_minutes = int((request.form.get("expires_minutes") or str(SHARE_DEFAULT_MINUTES)).strip())
     except ValueError:
-        expires_minutes = 60
-    expires_minutes = max(1, min(expires_minutes, 10080))
+        expires_minutes = SHARE_DEFAULT_MINUTES
+    expires_minutes = max(1, min(expires_minutes, SHARE_MAX_MINUTES))
 
     token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
     share = PasswordShareLink(
         password_id=row.id,
         org_id=org.id,
-        token_hash=token_hash,
+        token_hash=_share_hash(token),
         recipient_email=recipient_email,
+        note=note,
         expires_at=expires_at,
         created_by=current_user.id,
     )
     db.session.add(share)
     db.session.commit()
+    log_audit(
+        "share_create", "password", row.id, org_id=org.id,
+        details=f"Created one-time link for '{row.name}' (expires in {expires_minutes} min"
+                + (f", sent to {recipient_email}" if recipient_email else "") + ")",
+    )
 
     share_url = url_for("pw_share_open", token=token, _external=True)
+    emailed = False
     if recipient_email:
         try:
             send_email(
                 recipient_email,
-                f"One-time password share: {row.name}",
-                f"Open this one-time link before it expires:\n\n{share_url}\n\nThis link expires at {expires_at.strftime('%Y-%m-%d %H:%M UTC')} and works one time only.",
+                f"Secure one-time password link: {row.name}",
+                "A password has been securely shared with you.\n\n"
+                f"Open this link: {share_url}\n\n"
+                f"The link expires in {expires_minutes} minute(s) (at {expires_at.strftime('%Y-%m-%d %H:%M UTC')}) "
+                "and can only be revealed once. Copy the details somewhere safe as soon as you open it.",
             )
-            flash("One-time share link emailed.", "success")
+            emailed = True
+            flash("One-time link emailed.", "success")
         except Exception as e:
-            flash(f"Share link generated, but email failed: {e}", "warning")
+            flash(f"Link generated, but email failed: {e}", "warning")
     else:
-        flash("One-time share link generated.", "success")
-    return redirect(url_for("pw_view", pw_id=row.id, share_link=share_url))
+        flash("One-time link generated.", "success")
 
-@app.route("/shared/password/<token>")
+    # Hand the link to pw_view once via the session rather than the query string
+    # (query strings end up in browser history and server logs).
+    session["new_share_link"] = {
+        "pw_id": row.id,
+        "url": share_url,
+        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M UTC"),
+        "minutes": expires_minutes,
+        "emailed": emailed,
+    }
+    return redirect(url_for("pw_view", pw_id=row.id))
+
+@app.route("/passwords/<int:pw_id>/share/<int:share_id>/revoke", methods=["POST"])
+@login_required
+def pw_share_revoke(pw_id, share_id):
+    org = require_active_org()
+    if not org:
+        return redirect(url_for("orgs"))
+    share = db.session.get(PasswordShareLink, share_id)
+    if not share or share.password_id != pw_id or share.org_id != org.id:
+        flash("Share link not found.", "danger")
+        return redirect(url_for("pw_view", pw_id=pw_id))
+    if share_status(share) == "active":
+        share.revoked_at = datetime.utcnow()
+        db.session.commit()
+        log_audit("share_revoke", "password", pw_id, org_id=org.id, details="Revoked one-time link")
+        flash("Share link revoked.", "success")
+    return redirect(url_for("pw_view", pw_id=pw_id))
+
+@app.route("/shared/password/<token>", methods=["GET", "POST"])
 def pw_share_open(token):
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    share = PasswordShareLink.query.filter_by(token_hash=token_hash).first()
+    share = PasswordShareLink.query.filter_by(token_hash=_share_hash(token)).first()
     now = datetime.utcnow()
-    if not share or share.used_at is not None or now > share.expires_at:
-        return render_template("shared_password_view.html", expired=True, row=None, username=None, password=None)
 
+    def unavailable():
+        # One generic message for expired / used / revoked / unknown, so the
+        # page doesn't reveal anything about the link.
+        return _share_response(render_template("shared_password_view.html", state="unavailable"))
+
+    if not share or share_status(share, now) != "active":
+        return unavailable()
     row = db.session.get(Password, share.password_id)
     if not row or row.org_id != share.org_id:
-        return render_template("shared_password_view.html", expired=True, row=None, username=None, password=None)
+        return unavailable()
 
-    share.used_at = now
+    if request.method == "GET":
+        return _share_response(render_template(
+            "shared_password_view.html", state="ready", row=row, share=share,
+            seconds_left=max(0, int((share.expires_at - now).total_seconds())),
+        ))
+
+    # POST: consume atomically so two simultaneous requests can't both succeed.
+    ip = (request.remote_addr or "")[:64]
+    claimed = PasswordShareLink.query.filter(
+        PasswordShareLink.id == share.id,
+        PasswordShareLink.used_at.is_(None),
+        PasswordShareLink.revoked_at.is_(None),
+        PasswordShareLink.expires_at > now,
+    ).update({"used_at": now, "opened_ip": ip}, synchronize_session=False)
     db.session.commit()
-    return render_template(
-        "shared_password_view.html",
-        expired=False,
-        row=row,
+    if claimed != 1:
+        return unavailable()
+
+    log_audit(
+        "share_reveal", "password", row.id, org_id=row.org_id,
+        details=f"One-time link used for '{row.name}' from {ip or 'unknown IP'}",
+        user_id=share.created_by,
+    )
+    return _share_response(render_template(
+        "shared_password_view.html", state="revealed", row=row, share=share,
         username=decrypt_secret(row.username_plain),
         password=decrypt_secret(row.password_plain),
+        view_seconds=SHARE_VIEW_SECONDS,
+    ))
+
+
+# ---------------- Client playbook (PDF export) ----------------
+def collect_playbook_data(org, include_passwords):
+    """Gather everything for one organisation into plain dicts for playbook.py."""
+    def folder_path(folder_id):
+        parts, seen = [], set()
+        f = db.session.get(DocFolder, folder_id) if folder_id else None
+        while f and f.id not in seen:
+            seen.add(f.id)
+            parts.append(f.name)
+            f = f.parent
+        return " / ".join(reversed(parts))
+
+    contacts = SiteContact.query.filter_by(org_id=org.id).order_by(SiteContact.last_name, SiteContact.first_name).all()
+    sites = SiteAddress.query.filter_by(org_id=org.id).order_by(SiteAddress.site_name).all()
+    net = NetworkDevice.query.filter_by(org_id=org.id).order_by(NetworkDevice.device_name).all()
+    domains = Domain.query.filter_by(org_id=org.id).order_by(Domain.domain_name).all()
+    assets_ = Asset.query.filter_by(org_id=org.id).order_by(Asset.device_name).all()
+    pages = DocPage.query.filter_by(org_id=org.id).all()
+    files = DocFile.query.filter_by(org_id=org.id).all()
+    pws = Password.query.filter_by(org_id=org.id).order_by(Password.name).all()
+    custom_recs = CustomRecord.query.filter_by(org_id=org.id).order_by(CustomRecord.name).all()
+    ob = get_or_create_onboarding(org.id)
+
+    def related(kind, eid):
+        return [f"{d['kind_label']}: {d['name']}" for d in links_for(kind, eid, org.id)]
+
+    record_groups = {}
+    for r in custom_recs:
+        fields = []
+        for f in r.ctype.fields:
+            v = r.data.get(f["key"], "")
+            if f["type"] == "password":
+                v = decrypt_secret(v) if (include_passwords and v) else ("(omitted)" if v else "")
+            elif f["type"] == "checkbox":
+                v = "Yes" if v else "No"
+            fields.append({"label": f["label"], "value": v, "type": f["type"]})
+        g = record_groups.setdefault(r.type_id, {"name": r.ctype.label_plural, "singular": r.ctype.name, "records": []})
+        g["records"].append({"name": r.name, "fields": fields, "related": related("record", r.id), "updated": r.updated_at})
+    done, total, percent = onboarding_progress(ob)
+
+    def site_addr(s):
+        line3 = " ".join(x for x in [s.suburb, s.state, s.postcode] if x)
+        return "\n".join(x for x in [s.address1, s.address2, line3, s.country] if x)
+
+    upload_dir = org_upload_dir(org.id).resolve()
+    file_rows = []
+    for f in sorted(files, key=lambda x: (folder_path(x.folder_id).lower(), x.file_name.lower())):
+        disk = (upload_dir / Path(f.stored_name).name).resolve()
+        ok = disk.is_file() and str(disk).startswith(str(upload_dir))
+        file_rows.append({
+            "name": f.file_name, "path": folder_path(f.folder_id), "size": f.size_bytes,
+            "uploaded": f.uploaded_at, "disk_path": str(disk) if ok else None,
+        })
+
+    page_rows = sorted(
+        ({"title": p.title, "path": folder_path(p.folder_id), "html": p.body_html, "updated": p.updated_at} for p in pages),
+        key=lambda x: (x["path"].lower(), x["title"].lower()),
     )
 
-    log_audit("reveal", "password", row.id, org_id=org.id, details=f"Revealed password record: {row.name}")
-    return jsonify({
-        "username": decrypt_secret(row.username_plain) or "",
-        "password": decrypt_secret(row.password_plain) or "",
-        "otp_secret": decrypt_secret(row.otp_secret) or ""
-    })
+    return {
+        "org": {"name": org.name, "description": org.description},
+        "generated_at": datetime.utcnow(),
+        "generated_by": current_user.email,
+        "counts": {
+            "Contacts": len(contacts), "Sites": len(sites), "Network devices": len(net), "Domains": len(domains),
+            "Assets": len(assets_), "Documents": len(pages), "Files": len(files), "Passwords": len(pws),
+            "Custom records": len(custom_recs),
+        },
+        "onboarding": {
+            "done": done, "total": total, "percent": percent, "notes": ob.notes,
+            "items": [(label, bool(getattr(ob, f)), getattr(ob, f + "_by", None), getattr(ob, f + "_on", None))
+                      for f, label in ONBOARDING_FIELDS],
+        },
+        "contacts": [{"first": c.first_name, "last": c.last_name, "position": c.position, "email": c.email,
+                      "mobile": c.mobile, "office": c.office, "decision": c.is_decision_maker, "notes": c.notes}
+                     for c in contacts],
+        "sites": [{"name": s.site_name, "address": site_addr(s), "notes": s.notes, "related": related("site", s.id)} for s in sites],
+        "network": [{"name": n.device_name, "ip": n.ip_address, "mac": n.mac_address, "notes": n.notes} for n in net],
+        "domains": [{"name": d.domain_name, "registrar": d.registrar, "dns_provider": d.dns_provider,
+                     "nameservers": d.nameservers, "expires": d.expires_on, "notes": d.notes,
+                     "related": related("domain", d.id)} for d in domains],
+        "assets": [{
+            "name": a.device_name, "type": a.device_type, "brand": a.brand, "serial": a.serial_number,
+            "asset_id": a.asset_id, "purchased": a.date_purchased, "warranty": a.warranty_expires, "issued_to": a.issued_to, "location": a.location,
+            "notes": a.notes, "related": related("asset", a.id),
+            "status": a.assignment.status if a.assignment else None,
+            "site": a.assignment.site.site_name if a.assignment and a.assignment.site else None,
+            "contact": (f"{a.assignment.contact.first_name} {a.assignment.contact.last_name}"
+                        if a.assignment and a.assignment.contact else None),
+        } for a in assets_],
+        "doc_pages": page_rows,
+        "files": file_rows,
+        "passwords": [{
+            "name": p.name, "url": p.url, "username": decrypt_secret(p.username_plain),
+            # only decrypt secrets when they will actually be written to the PDF
+            "password": decrypt_secret(p.password_plain) if include_passwords else None,
+            "otp_secret": decrypt_secret(p.otp_secret) if include_passwords else None,
+            "notes": p.notes, "updated": p.updated_at, "related": related("password", p.id),
+        } for p in pws],
+        "records": list(record_groups.values()),
+    }
+
+PLAYBOOK_SECTIONS = [k for k, _ in playbook.SECTION_ORDER]
+
+@app.route("/orgs/<int:org_id>/export", methods=["GET", "POST"])
+@login_required
+def org_export(org_id):
+    org = db.session.get(Organization, org_id)
+    if not org:
+        abort(404)
+    session["active_org_id"] = org.id
+    can_export_pw = bool(current_user.is_admin or current_user.is_super_admin)
+
+    if request.method == "GET":
+        return render_template("org_export.html", org=org, sections=playbook.SECTION_ORDER, can_export_pw=can_export_pw,
+                               fonts_unicode=playbook.setup_fonts()["unicode"])
+
+    chosen = {s for s in request.form.getlist("sections") if s in PLAYBOOK_SECTIONS}
+    # credentials: "none" (omit section), "list" (usernames/URLs only), "full" (with passwords + 2FA secrets)
+    cred_mode = request.form.get("credentials") or "list"
+    if cred_mode not in ("none", "list", "full"):
+        cred_mode = "list"
+    include_pw = cred_mode == "full"
+    attach = request.form.get("attach_files") == "1"
+    pdf_pw = (request.form.get("pdf_password") or "").strip() or None
+
+    def back(msg):
+        flash(msg, "danger")
+        return redirect(url_for("org_export", org_id=org.id))
+
+    if include_pw:
+        if not can_export_pw:
+            log_audit("export_denied", "organization", org.id, org_id=org.id, details="Non-admin attempted a playbook export with passwords")
+            return back("Only administrators can export passwords.")
+        if not current_user.check_password(request.form.get("confirm_password") or ""):
+            log_audit("export_denied", "organization", org.id, org_id=org.id, details="Playbook export with passwords: wrong account password")
+            return back("Your account password was incorrect.")
+        if not pdf_pw or len(pdf_pw) < 12:
+            return back("An export that includes passwords must be protected with a PDF password of at least 12 characters.")
+    if cred_mode == "none":
+        chosen.discard("passwords")
+    else:
+        chosen.add("passwords")
+    if pdf_pw and len(pdf_pw) < 8:
+        return back("The PDF password must be at least 8 characters.")
+    if not chosen:
+        return back("Select at least one section.")
+    if (pdf_pw or attach) and not playbook.pypdf_available():
+        return back("Encryption and attachments need the 'pypdf' package (pip install -r requirements.txt).")
+
+    data = collect_playbook_data(org, include_pw)
+    logo = BASE_DIR / "static" / "img" / "coresight_logo.png"
+    try:
+        pdf_bytes, warnings = playbook.build_playbook(data, {
+            "sections": chosen, "include_passwords": include_pw, "attach_files": attach and "docs" in chosen,
+            "pdf_password": pdf_pw, "logo_path": str(logo) if logo.exists() else None,
+            "max_attach_bytes": int(os.environ.get("PLAYBOOK_MAX_ATTACH_MB", 100)) * 1024 * 1024,
+        })
+    except Exception as e:
+        app.logger.exception("Playbook export failed")
+        return back(f"Export failed: {type(e).__name__}. Check the server log.")
+
+    log_audit(
+        "export_playbook", "organization", org.id, org_id=org.id,
+        details=("Exported playbook PDF for '%s' [sections: %s; passwords: %s; attachments: %s; encrypted: %s]" % (
+            org.name, ", ".join(sorted(chosen)), "YES" if include_pw else "no", "yes" if attach else "no",
+            "yes" if pdf_pw else "no")),
+    )
+    for w in warnings[:5]:
+        flash(w, "warning")
+
+    safe = "".join(c for c in org.name if c.isalnum() or c in (" ", "-", "_")).strip().replace(" ", "_") or "client"
+    resp = send_file(io.BytesIO(pdf_bytes), as_attachment=True,
+                     download_name=f"{safe}_IT_Playbook_{datetime.utcnow():%Y-%m-%d}.pdf", mimetype="application/pdf")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+csrf.exempt(pw_share_open)
+
 # ---------------- Domains ----------------
 @app.route("/domains")
 @login_required
@@ -2198,6 +2791,12 @@ def assets_new():
                 a.date_purchased = datetime.strptime(dp, "%Y-%m-%d").date()
             except ValueError:
                 flash("Invalid purchase date.", "warning")
+        wd = (request.form.get("warranty_expires") or "").strip()
+        if wd:
+            try:
+                a.warranty_expires = datetime.strptime(wd, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Invalid warranty date.", "warning")
         if not a.device_name:
             flash("Device name required.", "warning")
             return render_template("asset_edit.html", org=org, asset=None, device_types=device_types, brands=brands)
@@ -2247,6 +2846,13 @@ def asset_edit(asset_id):
                 a.date_purchased = datetime.strptime(dp, "%Y-%m-%d").date()
             except ValueError:
                 flash("Invalid purchase date.", "warning")
+        wd = (request.form.get("warranty_expires") or "").strip()
+        a.warranty_expires = None
+        if wd:
+            try:
+                a.warranty_expires = datetime.strptime(wd, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Invalid warranty date.", "warning")
         db.session.commit()
         flash("Asset saved.", "success")
         return redirect(url_for("asset_view", asset_id=a.id))
@@ -2283,71 +2889,55 @@ def admin_users_new():
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
         pw = request.form.get("password") or ""
-        is_admin = True if request.form.get("is_admin") else False
-        is_super_admin = True if request.form.get("is_super_admin") else False
+        role = request.form.get("role") or "tech"
+        form = {"email": email, "role": role}
 
-        if not email or not pw:
-            flash("Email and password required.", "warning")
-            return render_template("admin_users_new.html")
-
-        if not password_meets_policy(pw):
-            flash("Password does not meet policy.", "warning")
-            return render_template("admin_users_new.html")
-
+        if not email:
+            flash("Email is required.", "warning")
+            return render_template("admin_users_new.html", roles=ROLES, form=form)
+        if pw and not password_meets_policy(pw):
+            flash("Password must be at least 10 characters and use 3 of: upper case, lower case, numbers, symbols.", "warning")
+            return render_template("admin_users_new.html", roles=ROLES, form=form)
         if User.query.filter_by(email=email).first():
             flash("User already exists.", "warning")
-            return render_template("admin_users_new.html")
+            return render_template("admin_users_new.html", roles=ROLES, form=form)
 
-        u = User(
-            email=email,
-            is_admin=is_admin,
-            is_super_admin=is_super_admin,
-            must_change_password=True
-        )
-        u.set_password(pw)
-
+        u = User(email=email, must_change_password=bool(pw))
+        apply_role(u, role)
+        # No password typed: give the account a random one nobody knows; the user sets their own via the link.
+        u.set_password(pw or secrets.token_urlsafe(32))
         db.session.add(u)
         db.session.commit()
+        log_audit("create", "user", u.id, details=f"Created user: {u.email} ({'temporary password' if pw else 'set-password link'})",
+                  user_id=current_user.id)
 
-        log_audit(
-            "create",
-            "user",
-            u.id,
-            details=f"Created user: {u.email}",
-            user_id=current_user.id
-        )
-
-        # Send welcome email
+        login_url = url_for("login", _external=True)
+        if pw:
+            # Never email the password itself: the admin passes it on separately.
+            body = (f"Hello,\n\nA CoreSight Vault account has been created for you.\n\nSign in at: {login_url}\n"
+                    f"Username: {u.email}\n\nYour administrator will give you a temporary password separately. "
+                    f"You'll be asked to choose your own password when you first sign in.\n\n"
+                    f"If you weren't expecting this, please contact your administrator.\n\nCoreSight Vault\n")
+        else:
+            link = url_for("reset_password", token=generate_reset_token(u, welcome=True), _external=True)
+            body = (f"Hello,\n\nA CoreSight Vault account has been created for you.\n\n"
+                    f"Choose your password using this link (it works once and expires in {WELCOME_LINK_MAX_AGE // 3600} hours):\n{link}\n\n"
+                    f"Then sign in at: {login_url}\nUsername: {u.email}\n\n"
+                    f"If you weren't expecting this, please contact your administrator.\n\nCoreSight Vault\n")
         try:
-            body = f"""Hello,
-
-Your CoreSight Vault account has been created.
-
-Login URL:
-{url_for('login', _external=True)}
-
-Username:
-{u.email}
-
-Temporary Password:
-{pw}
-
-For security reasons, you will be required to change this password on first login.
-
-If you were not expecting this account, please contact your administrator.
-
-Regards,
-CoreSight Vault
-"""
             send_email(u.email, "Welcome to CoreSight Vault", body)
-            flash("User created and welcome email sent.", "success")
-
+            flash("User created and welcome email sent." + ("" if not pw else " Give them the temporary password separately."), "success")
         except Exception as e:
-            flash(f"User created, but email failed: {e}", "warning")
-
+            app.logger.warning("Welcome email failed: %s", e)
+            if pw:
+                flash(f"User created, but the welcome email failed ({e}). Give them the temporary password yourself.", "warning")
+            else:
+                # Show the link once so the admin can pass it on another way.
+                return render_template("admin_users_new.html", roles=ROLES, form={}, created=u, link=link, email_error=str(e))
         return redirect(url_for("admin_users"))
 
-    return render_template("admin_users_new.html")
+    return render_template("admin_users_new.html", roles=ROLES, form={})
+
 @app.route("/admin/smtp", methods=["GET", "POST"])
 @login_required
 def admin_smtp():
@@ -2537,6 +3127,8 @@ def global_search():
             Password.name.ilike(f"%{q}%"),
             Password.url.ilike(f"%{q}%"),
             Password.notes.ilike(f"%{q}%"),
+            Password.folder.ilike(f"%{q}%"),
+            Password.tags.ilike(f"%{q}%"),
         )
     ).limit(20).all()
 
@@ -2690,6 +3282,20 @@ def global_search():
             "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('docs_page_view', page_id=row.id)}",
         })
 
+    rec_rows = CustomRecord.query.filter(db.or_(
+        CustomRecord.name.ilike(f"%{q}%"), CustomRecord.data_json.ilike(f"%{q}%"))).limit(20).all()
+    for row in rec_rows:
+        plain_keys = [f["key"] for f in row.ctype.fields if f["type"] != "password"]
+        text_blob = " ".join(str(row.data.get(k, "")) for k in plain_keys)
+        results.append({
+            "type": row.ctype.name,
+            "title": row.name,
+            "subtitle": "",
+            "snippet": _snippet(text_blob, q),
+            "org_name": org_name(row.org_id),
+            "url": url_for("org_view", org_id=row.org_id) + f"?next={url_for('record_view', rid=row.id)}",
+        })
+
     results = sorted(results, key=lambda x: (x["type"], x["title"].lower()))
     return jsonify({"results": results[:75]})
 
@@ -2711,14 +3317,72 @@ def seed_defaults():
     if not SMTPSettings.query.first():
         db.session.add(SMTPSettings())
     if not User.query.first():
-        u = User(email="admin@local", is_admin=True, is_super_admin=True)
+        u = User(email="admin@local", is_admin=True, is_super_admin=True, role="admin", must_change_password=True)
         u.set_password("admin")
         db.session.add(u)
     db.session.commit()
 
-with app.app_context():
-    db.create_all()
-    seed_defaults()
+SCHEMA_ADDITIONS = [
+    ("password_share_link", "note", "VARCHAR(500)"),
+    ("password_share_link", "revoked_at", "DATETIME"),
+    ("password_share_link", "opened_ip", "VARCHAR(64)"),
+    ("user", "role", "VARCHAR(20)"),
+    ("asset", "warranty_expires", "DATE"),
+    ("password", "folder", "VARCHAR(100)"),
+    ("password", "tags", "VARCHAR(500)"),
+    ("password", "rotate_days", "INTEGER"),
+    ("password", "password_changed_at", "DATETIME"),
+]
+
+def ensure_columns():
+    """create_all() won't add columns to existing tables, so add any that are missing."""
+    from sqlalchemy import inspect, text
+    insp = inspect(db.engine)
+    for table, col, ddl in SCHEMA_ADDITIONS:
+        if not insp.has_table(table):
+            continue
+        if col not in {c["name"] for c in insp.get_columns(table)}:
+            db.session.execute(text(f'ALTER TABLE "{table}" ADD COLUMN {col} {ddl}'))
+    db.session.execute(text(
+        "UPDATE \"user\" SET role = CASE WHEN is_super_admin OR is_admin THEN 'admin' ELSE 'tech' END WHERE role IS NULL"))
+    db.session.commit()
+
+# ---------------- Feature modules ----------------
+from types import SimpleNamespace
+import records, ops
+
+_ns = SimpleNamespace(**{k: v for k, v in globals().items() if not k.startswith("__")})
+records.init(_ns)
+ops.init(_ns)
+links_for = _ns.links_for   # used by collect_playbook_data (resolved at call time)
+
+def _startup():
+    """Create/upgrade the schema and seed defaults.
+
+    Several gunicorn workers import this module at the same moment; on a brand-new
+    database they would all try to create tables and seed rows together and crash
+    (UNIQUE constraint failed). A file lock makes them take turns: the first does
+    the work, the rest find it already done.
+    """
+    import hashlib, tempfile
+    lock_name = "coresight-startup-" + hashlib.sha1(app.config["SQLALCHEMY_DATABASE_URI"].encode()).hexdigest()[:12] + ".lock"
+    try:
+        import fcntl   # Linux/macOS (production); Windows dev runs a single process anyway
+    except ImportError:
+        fcntl = None
+    with open(os.path.join(tempfile.gettempdir(), lock_name), "w") as fh:
+        if fcntl:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            with app.app_context():
+                db.create_all()
+                ensure_columns()
+                seed_defaults()
+        finally:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+_startup()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=os.environ.get("FLASK_DEBUG") == "1")

@@ -1,0 +1,60 @@
+<div class="card shadow-sm mt-3">
+  <div class="card-body">
+    <h5 class="card-title">Related items</h5>
+    {% if items %}
+    <ul class="list-group list-group-flush mb-3">
+      {% for it in items %}
+      <li class="list-group-item d-flex justify-content-between align-items-center px-0 bg-transparent">
+        <span><span class="badge text-bg-secondary me-2">{{ it.kind_label }}</span><a href="{{ it.url }}">{{ it.name }}</a></span>
+        {% if can_write %}
+        <form method="post" action="{{ url_for('links_delete', link_id=it.link_id) }}">
+          <button class="btn btn-sm btn-outline-secondary" title="Remove this link">Unlink</button>
+        </form>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-muted small">Nothing linked yet. Link this to the passwords, assets, documents and other items it belongs with.</p>
+    {% endif %}
+
+    {% if can_write %}
+    <form method="post" action="{{ url_for('links_add') }}" class="row g-2 related-form" data-self="{{ kind }}:{{ entity_id }}">
+      <input type="hidden" name="a_type" value="{{ kind }}">
+      <input type="hidden" name="a_id" value="{{ entity_id }}">
+      <div class="col-md-3">
+        <select class="form-select form-select-sm rel-kind" aria-label="Type of item to link">
+          {% for val, label in kind_options %}<option value="{{ val }}">{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-md-4"><input class="form-control form-control-sm rel-q" placeholder="Search by name..." autocomplete="off"></div>
+      <div class="col-md-3">
+        <select name="b" class="form-select form-select-sm rel-result" required><option value="">Choose...</option></select>
+      </div>
+      <div class="col-md-2"><button class="btn btn-sm btn-primary w-100">Link</button></div>
+    </form>
+    <script>
+      (function () {
+        var f = document.currentScript.previousElementSibling;
+        var kind = f.querySelector('.rel-kind'), q = f.querySelector('.rel-q'), res = f.querySelector('.rel-result');
+        var timer;
+        function run() {
+          var url = "{{ url_for('links_search') }}?kind=" + encodeURIComponent(kind.value) +
+                    "&q=" + encodeURIComponent(q.value) + "&exclude=" + encodeURIComponent(f.dataset.self);
+          fetch(url).then(function (r) { return r.json(); }).then(function (rows) {
+            res.innerHTML = '';
+            var first = document.createElement('option'); first.value = ''; first.textContent = rows.length ? 'Choose...' : 'No matches';
+            res.appendChild(first);
+            rows.forEach(function (x) {
+              var o = document.createElement('option'); o.value = x.ref; o.textContent = x.name; res.appendChild(o);
+            });
+          });
+        }
+        kind.addEventListener('change', run);
+        q.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(run, 250); });
+        run();
+      })();
+    </script>
+    {% endif %}
+  </div>
+</div>
